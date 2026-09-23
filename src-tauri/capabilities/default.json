@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the main window. Tessera needs no filesystem, shell or network plugins in the webview; all cluster access happens in Rust.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

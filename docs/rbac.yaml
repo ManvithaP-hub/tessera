@@ -1,0 +1,31 @@
+# Minimal read-only access for Tessera.
+#
+# Tessera only lists and reads. Bind this ClusterRole to the user or group
+# your kubeconfig authenticates as, for example:
+#
+#   kubectl apply -f docs/rbac.yaml
+#   kubectl create clusterrolebinding tessera-viewer-jane \
+#     --clusterrole=tessera-viewer --user=jane@example.com
+#
+# On EKS with access entries, associate the principal with an access policy
+# or a Kubernetes group that is bound to this role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tessera-viewer
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]

@@ -1,0 +1,20 @@
+[package]
+name = "tessera-core"
+description = "Cluster snapshot and traffic-path diagnosis engine for Tessera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kube = { version = "4.2", features = ["oauth", "oidc", "gzip", "http-proxy"] }
+k8s-openapi = { version = "0.28", features = ["earliest"] }
+tokio = { version = "1", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

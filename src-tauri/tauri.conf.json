@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tessera",
+  "version": "0.1.0",
+  "identifier": "io.github.manvithap-hub.tessera",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tessera",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "See where Kubernetes requests break",
+    "longDescription": "Tessera is a read-only Kubernetes desktop app. It maps each request path from ingress to service, workload, pod and node, and diagnoses the layer where traffic breaks.",
+    "copyright": "Copyright 2026 Manvitha Potluri and contributors",
+    "license": "Apache-2.0",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
