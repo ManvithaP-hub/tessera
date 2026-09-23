@@ -16,9 +16,12 @@ cargo test -p tessera-core
 
 ## Ground rules
 
-- **Read-only, always.** Tessera must never create, update, patch or delete
-  cluster objects. Any PR that adds a write verb will be declined. Suggested
-  fixes are shown as text and commands for the user to run.
+- **Read-only by default.** Tessera never updates, patches or deletes your
+  objects, and suggested fixes are shown as text and commands for the user to
+  run. The one exception is `active.rs`: user-approved, short-lived probe pods
+  for network tests. Any new write path needs the same approve-then-run flow
+  and a strong reason.
+- **Cloud calls are read-only and allow-listed** in `cloud.rs`.
 - **No telemetry and no network calls** other than to the API servers in the
   user's kubeconfig.
 - **Rules need evidence.** Every issue should say what was observed and give a

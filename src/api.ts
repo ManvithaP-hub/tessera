@@ -2,8 +2,8 @@
 // without Tauri), it serves a built-in demo cluster instead, which is handy
 // for UI work and screenshots.
 
-import type { ClusterGraph, Contexts } from "./types";
-import { demoContexts, demoGraph, demoLogs } from "./demo";
+import type { ClusterGraph, Contexts, NetworkTestReport, Settings, TestPlan } from "./types";
+import { demoContexts, demoGraph, demoLogs, demoPlan, demoReport } from "./demo";
 
 export const demoMode = !("__TAURI_INTERNALS__" in window);
 
@@ -16,9 +16,25 @@ export function listContexts(): Promise<Contexts> {
   return demoMode ? Promise.resolve(demoContexts) : call("list_contexts");
 }
 
-export function snapshot(context: string): Promise<ClusterGraph> {
-  if (demoMode) return new Promise((r) => setTimeout(() => r(demoGraph(context)), 250));
-  return call("cluster_snapshot", { context });
+export function snapshot(context: string, s: Settings): Promise<ClusterGraph> {
+  if (demoMode) return new Promise((r) => setTimeout(() => r(demoGraph(context, s.cloudChecks)), 250));
+  return call("cluster_snapshot", {
+    context,
+    options: { cloudChecks: s.cloudChecks, awsProfile: s.awsProfile || null, awsRegion: s.awsRegion || null },
+  });
+}
+
+export function planNetworkTest(context: string, namespace: string, service: string, sourceNamespace: string, s: Settings): Promise<{ id: string; plan: TestPlan }> {
+  if (demoMode) return new Promise((r) => setTimeout(() => r({ id: "demo", plan: demoPlan(namespace, service, sourceNamespace || namespace, s.probeImage) }), 300));
+  return call("plan_network_test", {
+    context,
+    request: { namespace, service, sourceNamespace: sourceNamespace || null, image: s.probeImage || null, clusterDomain: s.clusterDomain || null },
+  });
+}
+
+export function runNetworkTest(planId: string, plan: TestPlan): Promise<NetworkTestReport> {
+  if (demoMode) return new Promise((r) => setTimeout(() => r(demoReport(plan)), 1500));
+  return call("run_network_test", { planId });
 }
 
 export function podLogs(

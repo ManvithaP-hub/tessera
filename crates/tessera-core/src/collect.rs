@@ -40,8 +40,19 @@ fn describe_err(what: &str, e: &kube::Error) -> String {
     }
 }
 
+/// Optional checks that go beyond the Kubernetes API.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectOptions {
+    /// Query the cloud provider for load balancer target health (read-only CLI calls).
+    pub cloud_checks: bool,
+    /// Overrides for the AWS CLI; otherwise taken from the kubeconfig exec config.
+    pub aws_profile: Option<String>,
+    pub aws_region: Option<String>,
+}
+
 /// Take one read-only snapshot of the cluster and diagnose it.
-pub async fn collect(client: Client, context: &str) -> Result<ClusterGraph> {
+pub async fn collect(client: Client, context: &str, opts: &CollectOptions) -> Result<ClusterGraph> {
     // Fail fast with a clear error when the API server is unreachable or
     // credentials are rejected, instead of returning an empty map.
     let version = client.apiserver_version().await?;
@@ -100,6 +111,17 @@ pub async fn collect(client: Client, context: &str) -> Result<ClusterGraph> {
     let mut g = build_graph(&raw, context);
     g.server_version = Some(version.git_version);
     g.warnings = warnings;
+    if opts.cloud_checks {
+        let env = crate::cloud::AwsEnv::for_context(context, opts);
+        g.lb_health = crate::cloud::load_balancer_health(&g, &env).await;
+        for h in g.lb_health.iter().filter_map(|h| h.error.as_ref()) {
+            if !g.warnings.contains(h) {
+                g.warnings.push(h.clone());
+            }
+        }
+        // Re-run diagnosis with the cloud data included.
+        g.issues = diagnose(&g);
+    }
     Ok(g)
 }
 
@@ -352,6 +374,14 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
             .map(|v| v.iter().filter_map(|i| i.hostname.clone().or_else(|| i.ip.clone())).collect())
             .unwrap_or_default();
         let tls_secrets = spec.tls.unwrap_or_default().iter().filter_map(|t| t.secret_name.clone()).collect();
+        let gce_backends = ing
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("ingress.kubernetes.io/backends"))
+            .and_then(|v| serde_json::from_str::<BTreeMap<String, String>>(v).ok())
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
         g.ingresses.push(IngressInfo {
             namespace: ns,
             name,
@@ -359,6 +389,7 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
             addresses,
             routes,
             tls_secrets,
+            gce_backends,
         });
     }
 
@@ -644,9 +675,59 @@ fn container_specs(spec: &PodSpec) -> Vec<ContainerSpecInfo> {
                 cpu_request_milli: cpu,
                 memory_request_bytes: mem_req,
                 memory_limit_bytes: mem_lim,
+                ports: c
+                    .ports
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| ContainerPortInfo {
+                        name: p.name,
+                        port: p.container_port,
+                        protocol: p.protocol.unwrap_or_else(|| "TCP".into()),
+                    })
+                    .collect(),
+                probes: [
+                    ("liveness", &c.liveness_probe),
+                    ("readiness", &c.readiness_probe),
+                    ("startup", &c.startup_probe),
+                ]
+                .into_iter()
+                .filter_map(|(k, p)| p.as_ref().map(|p| probe_spec(k, p)))
+                .collect(),
             }
         })
         .collect()
+}
+
+fn int_or_str(v: &IntOrString) -> String {
+    match v {
+        IntOrString::Int(i) => i.to_string(),
+        IntOrString::String(s) => s.clone(),
+    }
+}
+
+fn probe_spec(kind: &str, p: &k8s_openapi::api::core::v1::Probe) -> ProbeSpec {
+    let (handler, path, port, scheme) = if let Some(h) = &p.http_get {
+        ("http", Some(h.path.clone().unwrap_or_else(|| "/".into())), Some(int_or_str(&h.port)), h.scheme.clone())
+    } else if let Some(t) = &p.tcp_socket {
+        ("tcp", None, Some(int_or_str(&t.port)), None)
+    } else if let Some(g) = &p.grpc {
+        ("grpc", None, Some(g.port.to_string()), None)
+    } else {
+        ("exec", None, None, None)
+    };
+    ProbeSpec {
+        kind: kind.into(),
+        handler: handler.into(),
+        path,
+        port,
+        scheme,
+        // API defaults when unset.
+        initial_delay: p.initial_delay_seconds.unwrap_or(0),
+        timeout: p.timeout_seconds.unwrap_or(1),
+        period: p.period_seconds.unwrap_or(10),
+        failure_threshold: p.failure_threshold.unwrap_or(3),
+    }
 }
 
 fn resources(c: &Container) -> (Option<i64>, Option<i64>, Option<i64>) {
@@ -670,6 +751,14 @@ fn convert_node(n: &Node) -> NodeInfo {
         instance_type: n.metadata.labels.as_ref().and_then(|l| l.get("node.kubernetes.io/instance-type").cloned()),
         cpu_allocatable_milli: alloc.get("cpu").and_then(|q| quantity::cpu_milli(&q.0)).unwrap_or(0),
         memory_allocatable_bytes: alloc.get("memory").and_then(|q| quantity::bytes(&q.0)).unwrap_or(0),
+        network_unavailable: conds.iter().any(|c| c.type_ == "NetworkUnavailable" && c.status == "True"),
+        instance_id: n
+            .spec
+            .as_ref()
+            .and_then(|s| s.provider_id.as_ref())
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
         pressure: conds
             .iter()
             .filter(|c| c.type_ != "Ready" && c.status == "True" && c.type_.ends_with("Pressure"))

@@ -36,6 +36,12 @@ rules:
   - apiGroups: ["networking.istio.io"]
     resources: ["virtualservices", "destinationrules"]
     verbs: ["get", "list"]
+  # Optional: network tests. Creates short-lived probe pods only in the
+  # namespaces you test from. For tighter control, grant this with a Role in
+  # specific namespaces instead of cluster-wide.
+  # - apiGroups: [""]
+  #   resources: ["pods"]
+  #   verbs: ["create", "delete"]
   # Optional: lets Tessera check that ingress TLS secrets exist. Tessera
   # requests metadata only (names), never secret contents, but Kubernetes RBAC
   # can't grant "names only", so leave this out if that's a concern. The TLS

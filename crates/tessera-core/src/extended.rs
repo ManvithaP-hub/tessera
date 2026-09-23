@@ -20,6 +20,9 @@ pub fn run(g: &ClusterGraph, out: &mut Vec<Issue>) {
     hpa_rules(g, out);
     eviction_rules(g, out);
     mesh_rules(g, out);
+    lb_target_rules(g, out);
+    cni_rules(g, out);
+    probe_rules(g, out);
 }
 
 /* ---------------- helpers ---------------- */
@@ -919,6 +922,403 @@ fn mesh_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
                             vec![],
                         ));
                     }
+                }
+            }
+        }
+    }
+}
+
+/* ---------------- Cloud load balancer targets ---------------- */
+
+fn lb_reason_advice(reason: &str, hc: &str, readiness_path: Option<&str>) -> String {
+    match reason {
+        "Target.ResponseCodeMismatch" => {
+            let mut s = format!(
+                "The health check reaches the pods but gets the wrong HTTP status ({hc}). Make that path return a success code, or point the health check at one that does (AWS Load Balancer Controller: the alb.ingress.kubernetes.io/healthcheck-path annotation)."
+            );
+            if let Some(p) = readiness_path {
+                s.push_str(&format!(" Your readiness probe uses {p}, which is usually the right path."));
+            }
+            s
+        }
+        "Target.Timeout" => "The load balancer can't reach the targets in time. Most often a security group doesn't let the load balancer reach the node or pod port, or a NetworkPolicy doesn't admit the VPC CIDR.".into(),
+        "Target.FailedHealthChecks" => format!("Health check connections fail ({hc}). Check the app listens on that port and security groups allow it."),
+        "Target.NotInUse" => "Targets are in an Availability Zone the load balancer isn't enabled for. Add that zone's subnet to the load balancer.".into(),
+        "Target.InvalidState" => "The target instances are stopped or terminated.".into(),
+        "Target.IpUnusable" => "The target IP is in use by a load balancer or isn't valid; the pod may have been replaced.".into(),
+        "Target.NotRegistered" => "Targets aren't registered. Check the TargetGroupBinding and the load balancer controller's logs.".into(),
+        "Instance" | "ELB" => format!("The instances fail the health check ({hc})."),
+        _ => format!("Check the health check settings ({hc}) against what the app serves."),
+    }
+}
+
+fn lb_target_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
+    for h in g.lb_health.iter().filter(|h| h.error.is_none()) {
+        let src = &h.source;
+        for tg in &h.target_groups {
+            let cmds = vec![format!(
+                "aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names {} --query 'TargetGroups[0].TargetGroupArn' --output text)",
+                tg.name
+            )];
+            if tg.targets.is_empty() {
+                out.push(issue(
+                    format!("lb-no-targets:{}/{}/{}", src.namespace, src.name, tg.name),
+                    Severity::Critical,
+                    Layer::Entry,
+                    src.clone(),
+                    format!("Load balancer target group {} has no targets", tg.name),
+                    format!("{} ({}) has nothing to send traffic to, so every request fails with 503.", h.lb_name, h.dns_name),
+                    vec![format!("target group {}: 0 registered targets", tg.name), format!("health check: {}", tg.health_check)],
+                    "Check the backing service has ready endpoints, and the load balancer controller's logs for registration errors.".into(),
+                    cmds,
+                    vec![],
+                ));
+                continue;
+            }
+            let bad: Vec<&TargetHealth> =
+                tg.targets.iter().filter(|t| t.state == "unhealthy" || t.state == "unavailable").collect();
+            let healthy = tg.targets.iter().filter(|t| t.state == "healthy").count();
+            let stale: Vec<&TargetHealth> = tg
+                .targets
+                .iter()
+                .filter(|t| t.resolved.is_none() && t.state != "draining" && tg.target_type == "ip")
+                .collect();
+            if !bad.is_empty() {
+                let reason = bad.iter().filter_map(|t| t.reason.clone()).next().unwrap_or_default();
+                let readiness_path = bad
+                    .iter()
+                    .filter_map(|t| t.resolved.as_ref())
+                    .filter_map(|r| r.split_once('/'))
+                    .filter_map(|(ns, name)| g.pods.iter().find(|p| p.namespace == ns && p.name == name))
+                    .filter_map(|p| g.workloads.iter().find(|w| Some(&w.id) == p.workload.as_ref()))
+                    .flat_map(|w| w.containers.iter().flat_map(|c| c.probes.iter()))
+                    .find(|p| p.kind == "readiness" && p.handler == "http")
+                    .and_then(|p| p.path.clone());
+                out.push(issue(
+                    format!("lb-targets-unhealthy:{}/{}/{}", src.namespace, src.name, tg.name),
+                    if healthy == 0 { Severity::Critical } else { Severity::Warning },
+                    Layer::Entry,
+                    src.clone(),
+                    format!("{} of {} load balancer targets are unhealthy in {}", bad.len(), tg.targets.len(), tg.name),
+                    if healthy == 0 {
+                        "The cloud load balancer considers every target unhealthy, so users get 502/503 even if the pods look fine inside the cluster.".into()
+                    } else {
+                        "Some targets fail the load balancer's health check and receive no traffic, reducing capacity.".into()
+                    },
+                    std::iter::once(format!("health check: {}", tg.health_check))
+                        .chain(bad.iter().take(6).map(|t| {
+                            format!(
+                                "{}{}{}: {} {}{}",
+                                t.id,
+                                t.port.map(|p| format!(":{p}")).unwrap_or_default(),
+                                t.resolved.as_ref().map(|r| format!(" ({r})")).unwrap_or_default(),
+                                t.state,
+                                t.reason.clone().unwrap_or_default(),
+                                t.description.as_ref().map(|d| format!(": {d}")).unwrap_or_default()
+                            )
+                        }))
+                        .collect(),
+                    lb_reason_advice(&reason, &tg.health_check, readiness_path.as_deref()),
+                    cmds.clone(),
+                    bad.iter().filter_map(|t| t.resolved.as_ref()).filter_map(|r| r.split_once('/').map(|x| x.1.to_string())).collect(),
+                ));
+            }
+            if !stale.is_empty() {
+                out.push(issue(
+                    format!("lb-stale-targets:{}/{}/{}", src.namespace, src.name, tg.name),
+                    Severity::Warning,
+                    Layer::Entry,
+                    src.clone(),
+                    format!("{} load balancer targets don't match any current pod", stale.len()),
+                    "The target group still lists IPs that no pod uses. The controller may be lagging or failing to deregister them, and requests to those IPs fail.".into(),
+                    stale.iter().take(6).map(|t| format!("{}: {}", t.id, t.state)).collect(),
+                    "Check the AWS Load Balancer Controller logs for reconcile errors.".into(),
+                    cmds,
+                    vec![],
+                ));
+            }
+        }
+    }
+    // GKE ingress-gce publishes backend health on the ingress itself.
+    for ing in g.ingresses.iter().filter(|i| !i.gce_backends.is_empty()) {
+        let bad: Vec<&(String, String)> =
+            ing.gce_backends.iter().filter(|(_, h)| h.eq_ignore_ascii_case("UNHEALTHY")).collect();
+        if bad.is_empty() {
+            continue;
+        }
+        let all = bad.len() == ing.gce_backends.len();
+        out.push(issue(
+            format!("lb-gce-unhealthy:{}/{}", ing.namespace, ing.name),
+            if all { Severity::Critical } else { Severity::Warning },
+            Layer::Entry,
+            target("Ingress", &ing.namespace, &ing.name),
+            format!("{} of {} Google load balancer backends are unhealthy", bad.len(), ing.gce_backends.len()),
+            "Google's health checks fail for these backends, so the load balancer won't send them traffic.".into(),
+            bad.iter().map(|(b, h)| format!("{b}: {h}")).collect(),
+            "GKE derives the health check from the pod's readiness probe, or uses / when there isn't one. Make sure that path returns 200, or set a BackendConfig healthCheck, and that firewall rules allow Google's health check ranges.".into(),
+            vec![format!("kubectl describe ingress {} -n {}", ing.name, ing.namespace)],
+            vec![],
+        ));
+    }
+}
+
+/* ---------------- Pod networking: CNI and kube-proxy ---------------- */
+
+const CNI_AGENTS: [&str; 11] = [
+    "aws-node",
+    "calico-node",
+    "cilium",
+    "kube-flannel-ds",
+    "kube-flannel",
+    "weave-net",
+    "canal",
+    "antrea-agent",
+    "kube-router",
+    "ovnkube-node",
+    "azure-cni",
+];
+
+fn cni_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
+    for w in g.workloads.iter().filter(|w| w.kind == "DaemonSet" && w.namespace == "kube-system") {
+        let is_cni = CNI_AGENTS.contains(&w.name.as_str());
+        let is_proxy = w.name == "kube-proxy";
+        if !(is_cni || is_proxy) || w.ready >= w.desired {
+            continue;
+        }
+        let bad_nodes: Vec<String> = g
+            .pods
+            .iter()
+            .filter(|p| p.workload.as_ref() == Some(&w.id) && !p.ready)
+            .filter_map(|p| p.node.clone())
+            .collect();
+        let affected = g
+            .pods
+            .iter()
+            .filter(|p| p.node.as_ref().is_some_and(|n| bad_nodes.contains(n)) && p.namespace != "kube-system")
+            .count();
+        let (rule, what, effect) = if is_proxy {
+            (
+                "kubeproxy-unready",
+                "kube-proxy",
+                "Service IPs may stop working on those nodes: new or changed services aren't programmed, so pods there can't reach them.",
+            )
+        } else {
+            ("cni-agent-unready", "the CNI agent", "Pods on those nodes can't get IP addresses or reach the network; new pods there get stuck in ContainerCreating.")
+        };
+        out.push(issue(
+            format!("{rule}:{}", w.id),
+            Severity::Critical,
+            Layer::Node,
+            target(&w.kind, &w.namespace, &w.name),
+            format!("{} of {} {} pods aren't ready", w.desired - w.ready, w.desired, w.name),
+            format!("{} isn't running properly on {}. {effect}", what, if bad_nodes.is_empty() { "some nodes".to_string() } else { bad_nodes.join(", ") }),
+            vec![
+                format!("{}: desired {}, ready {}", w.name, w.desired, w.ready),
+                format!("other pods on affected nodes: {affected}"),
+            ],
+            if is_proxy {
+                "Check the kube-proxy pod logs on the affected nodes.".into()
+            } else if w.name == "aws-node" {
+                "Check the aws-node logs and the node role's permissions for the VPC CNI (AmazonEKS_CNI_Policy), and that the add-on version matches the cluster.".into()
+            } else {
+                "Check the CNI agent's logs on the affected nodes.".into()
+            },
+            vec![format!("kubectl get pods -n kube-system -o wide | grep {}", w.name), format!("kubectl logs -n kube-system ds/{} --tail=50", w.name)],
+            vec![],
+        ));
+    }
+    for n in g.nodes.iter().filter(|n| n.network_unavailable) {
+        out.push(issue(
+            format!("cni-node-network:{}", n.name),
+            Severity::Critical,
+            Layer::Node,
+            target("Node", "", &n.name),
+            format!("Node {} reports NetworkUnavailable", n.name),
+            "The network plugin hasn't configured routes for this node, so its pods can't talk to the rest of the cluster.".into(),
+            vec!["condition NetworkUnavailable: True".into()],
+            "Check the CNI agent pod on this node.".into(),
+            vec![format!("kubectl describe node {}", n.name)],
+            vec![],
+        ));
+    }
+    // Sandbox failures from the CNI, grouped: IP exhaustion vs anything else.
+    let mut ip_ex: BTreeMap<String, (Vec<&PodInfo>, String)> = BTreeMap::new();
+    let mut other: BTreeMap<String, (Vec<&PodInfo>, String)> = BTreeMap::new();
+    for e in g.events.iter().filter(|e| e.kind == "Pod" && e.reason == "FailedCreatePodSandBox") {
+        let Some(p) = g.pods.iter().find(|p| p.namespace == e.namespace && p.name == e.name) else { continue };
+        if p.phase != "Pending" {
+            continue;
+        }
+        let m = e.message.to_lowercase();
+        let node = p.node.clone().unwrap_or_else(|| "unknown".into());
+        let bucket = if m.contains("assign an ip")
+            || m.contains("no available ip")
+            || m.contains("insufficientfreeaddresses")
+            || m.contains("failed to allocate")
+        {
+            &mut ip_ex
+        } else if m.contains("network") || m.contains("cni") {
+            &mut other
+        } else {
+            continue;
+        };
+        let entry = bucket.entry(node).or_insert_with(|| (vec![], e.message.clone()));
+        entry.0.push(p);
+    }
+    for (node, (pods, msg)) in ip_ex {
+        out.push(issue(
+            format!("cni-ip-exhausted:{node}"),
+            Severity::Critical,
+            Layer::Node,
+            target("Node", "", &node),
+            format!("Pods on {node} can't get an IP address"),
+            format!("{} pods are stuck in ContainerCreating because the network plugin has no free IPs to give them.", pods.len()),
+            vec![msg],
+            "On EKS with the VPC CNI: enable prefix delegation (ENABLE_PREFIX_DELEGATION=true), add larger subnets or a secondary CIDR, or lower WARM_IP_TARGET. Also check the node's max-pods matches its ENI limits.".into(),
+            vec![format!("kubectl describe node {node}"), "kubectl -n kube-system logs ds/aws-node --tail=50".into()],
+            pods.iter().map(|p| p.name.clone()).collect(),
+        ));
+    }
+    for (node, (pods, msg)) in other {
+        out.push(issue(
+            format!("cni-sandbox-failed:{node}"),
+            Severity::Critical,
+            Layer::Node,
+            target("Node", "", &node),
+            format!("Pods on {node} fail network setup"),
+            format!("{} pods can't start because the network plugin failed to set up their sandbox.", pods.len()),
+            vec![msg],
+            "Check the CNI agent pod on this node and its logs; restarting it often clears stale state.".into(),
+            vec![format!("kubectl get pods -n kube-system -o wide --field-selector spec.nodeName={node}")],
+            pods.iter().map(|p| p.name.clone()).collect(),
+        ));
+    }
+}
+
+/* ---------------- Probe configuration ---------------- */
+
+fn probe_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
+    for w in &g.workloads {
+        let pods: Vec<&PodInfo> = g.pods.iter().filter(|p| p.workload.as_ref() == Some(&w.id)).collect();
+        let restarts: i32 = pods.iter().map(|p| p.restarts).sum();
+        let cmds = vec![format!("kubectl get {} {} -n {} -o yaml", w.kind.to_lowercase(), w.name, w.namespace)];
+        for c in &w.containers {
+            // Named probe ports must exist on the container.
+            for pr in &c.probes {
+                let Some(port) = &pr.port else { continue };
+                if port.parse::<i32>().is_err() && !c.ports.iter().any(|p| p.name.as_deref() == Some(port.as_str())) {
+                    out.push(issue(
+                        format!("probe-port-undefined:{}:{}:{}", w.id, c.name, pr.kind),
+                        Severity::Critical,
+                        Layer::Pod,
+                        target(&w.kind, &w.namespace, &w.name),
+                        format!(
+                            "The {} probe on {} uses port \"{port}\", which the container doesn't define",
+                            pr.kind, c.name
+                        ),
+                        "A named probe port must match a named containerPort, so this probe can never succeed.".into(),
+                        vec![
+                            format!("{} probe port: {port}", pr.kind),
+                            format!(
+                                "container ports: {}",
+                                if c.ports.is_empty() {
+                                    "<none>".to_string()
+                                } else {
+                                    c.ports
+                                        .iter()
+                                        .map(|p| format!("{}={}", p.name.clone().unwrap_or_default(), p.port))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                            ),
+                        ],
+                        "Name the container port to match, or use the port number in the probe.".into(),
+                        cmds.clone(),
+                        vec![],
+                    ));
+                }
+            }
+            let live = c.probes.iter().find(|p| p.kind == "liveness");
+            let ready = c.probes.iter().find(|p| p.kind == "readiness");
+            let startup = c.probes.iter().find(|p| p.kind == "startup");
+            // Probes timing out.
+            let timeouts: Vec<&EventInfo> = g
+                .events
+                .iter()
+                .filter(|e| {
+                    e.reason == "Unhealthy"
+                        && e.namespace == w.namespace
+                        && pods.iter().any(|p| p.name == e.name)
+                        && (e.message.contains("context deadline exceeded")
+                            || e.message.contains("Client.Timeout")
+                            || e.message.contains("timeout"))
+                })
+                .collect();
+            if let Some(e) = timeouts.first() {
+                let which = if e.message.starts_with("Liveness") {
+                    live
+                } else if e.message.starts_with("Startup") {
+                    startup
+                } else {
+                    ready
+                };
+                if let Some(pr) = which {
+                    out.push(issue(
+                        format!("probe-timeout:{}:{}:{}", w.id, c.name, pr.kind),
+                        Severity::Warning,
+                        Layer::Pod,
+                        target(&w.kind, &w.namespace, &w.name),
+                        format!("The {} probe on {} is timing out after {}s", pr.kind, c.name, pr.timeout),
+                        "The endpoint answers slower than the probe allows. Under load this marks pods unready or restarts them, which adds more load to the rest.".into(),
+                        vec![format!("Unhealthy: {}", e.message), format!("timeoutSeconds: {}, periodSeconds: {}, failureThreshold: {}", pr.timeout, pr.period, pr.failure_threshold)],
+                        "Make the endpoint cheap (no database or downstream calls in a liveness check), or raise timeoutSeconds.".into(),
+                        cmds.clone(),
+                        vec![],
+                    ));
+                }
+            }
+            // Liveness identical to readiness while the workload is restarting.
+            if let (Some(l), Some(r)) = (live, ready) {
+                let same = l.handler == r.handler && l.path == r.path && l.port == r.port;
+                if same && restarts > 0 && l.handler != "exec" {
+                    out.push(issue(
+                        format!("probe-liveness-equals-readiness:{}:{}", w.id, c.name),
+                        Severity::Warning,
+                        Layer::Pod,
+                        target(&w.kind, &w.namespace, &w.name),
+                        format!("{} uses the same check for liveness and readiness, and is restarting", c.name),
+                        format!("When the app is busy or a dependency is slow, the shared check fails and the kubelet restarts the pod instead of just taking it out of rotation. {restarts} restarts so far."),
+                        vec![format!("liveness and readiness: {} {}{}", l.handler, l.path.clone().unwrap_or_default(), l.port.as_ref().map(|p| format!(" port {p}")).unwrap_or_default())],
+                        "Keep readiness as is, and make liveness a lighter check that only fails if the process is truly stuck.".into(),
+                        cmds.clone(),
+                        vec![],
+                    ));
+                }
+            }
+            // Liveness killing slow starters.
+            let liveness_kills = g.events.iter().any(|e| {
+                e.reason == "Unhealthy"
+                    && e.namespace == w.namespace
+                    && pods.iter().any(|p| p.name == e.name)
+                    && e.message.starts_with("Liveness")
+            });
+            if let (Some(l), None) = (live, startup) {
+                if liveness_kills && restarts > 0 && l.initial_delay < 15 {
+                    out.push(issue(
+                        format!("probe-no-startup:{}:{}", w.id, c.name),
+                        Severity::Warning,
+                        Layer::Pod,
+                        target(&w.kind, &w.namespace, &w.name),
+                        format!("{} may be killed while it's still starting", c.name),
+                        format!(
+                            "Liveness checks begin after {}s and there's no startupProbe, so a slow start looks like a hang and the kubelet restarts it.",
+                            l.initial_delay
+                        ),
+                        vec![format!("liveness: initialDelaySeconds {}, periodSeconds {}, failureThreshold {}", l.initial_delay, l.period, l.failure_threshold)],
+                        "Add a startupProbe with the same check and a generous failureThreshold; liveness then only starts once the app is up.".into(),
+                        cmds.clone(),
+                        vec![],
+                    ));
                 }
             }
         }

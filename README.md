@@ -30,17 +30,37 @@ and what to change.
   service with no endpoints is marked as a symptom when its pods explain why.
 - **Evidence you can check.** Every issue lists what was observed and the
   read-only `kubectl` commands to confirm it yourself.
+- **Cloud load balancer target health (AWS).** Which ALB, NLB or Classic ELB
+  targets are unhealthy and why (wrong status code, timeouts, AZ not enabled,
+  stale targets), cross-checked with your readiness probes. GKE backend health
+  is read straight from the ingress.
+- **Network tests you approve.** Probe pods on the target's node and on another
+  node test DNS, the service IP, each pod IP and the pods' own health
+  endpoints. Comparing them tells apart DNS faults, kube-proxy faults,
+  cross-node CNI faults, NetworkPolicy drops, and apps not listening.
+- **Pod networking and probe health.** CNI agents and kube-proxy not ready, VPC
+  CNI IP exhaustion, nodes with NetworkUnavailable, probe ports that don't
+  exist, probes timing out, liveness checks identical to readiness, and slow
+  starters killed by liveness.
 - **Pod logs,** including the previous container after a crash.
 - **Any cluster your kubeconfig reaches.** EKS, GKE, AKS, kind, k3s and others,
   including exec credential plugins such as `aws eks get-token`.
 
 ![Issue trace](docs/screenshot-issues.png)
 
+![Network test](docs/screenshot-network-test.png)
+
 ## Safe by design
 
-- **Read-only.** Tessera only uses `get` and `list`, plus reading pod logs. It
-  has no code path that changes your cluster. A minimal ClusterRole is in
-  [`docs/rbac.yaml`](docs/rbac.yaml).
+- **Read-only by default.** Tessera only uses `get` and `list`, plus reading
+  pod logs. A minimal ClusterRole is in [`docs/rbac.yaml`](docs/rbac.yaml).
+- **Active tests only with your approval.** A network test shows you the exact
+  probe pods first, and creates nothing until you click Run. The pods are
+  non-root, have no service account token or capabilities, stop after 90
+  seconds, and are deleted when the test ends.
+- **Cloud checks are opt-in.** Load balancer target health uses your existing
+  `aws` CLI with a fixed list of read-only `describe` calls. No cloud
+  credentials are stored.
 - **No telemetry.** It talks to your API servers and nothing else.
 - **Local only.** Credentials stay in memory in the Rust process. The UI can't
   touch your filesystem or the network.
@@ -90,8 +110,8 @@ to add a diagnosis rule.
 ## Roadmap
 
 - Watch-based live updates instead of polling
-- Optional probes for what the API can't show: cloud load balancer target
-  health (AWS, GCP, Azure), in-cluster DNS lookups, and pod-to-pod reachability
+- Azure load balancer and Application Gateway health; GKE L4 load balancers
+- Testing from a specific workload's point of view (ephemeral containers)
 - Gateway API, Linkerd and Traefik routes
 - Optional AI explanation of an issue using a model you choose (your own API
   key, Amazon Bedrock in your account, or a local model), off by default

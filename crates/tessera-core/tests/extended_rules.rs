@@ -385,3 +385,246 @@ fn every_rule_gets_a_category() {
         assert_ne!(Category::for_rule(id), Category::Other, "{id}");
     }
 }
+
+fn workload(ns: &str, name: &str, kind: &str, desired: i32, ready: i32) -> WorkloadInfo {
+    WorkloadInfo {
+        id: workload_id(kind, ns, name),
+        kind: kind.into(),
+        namespace: ns.into(),
+        name: name.into(),
+        desired,
+        ready,
+        pod_labels: labels(&[("app", name)]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn lb_targets_unhealthy_uses_readiness_path() {
+    let mut w = workload("web", "shop", "Deployment", 2, 2);
+    w.containers = vec![ContainerSpecInfo {
+        name: "shop".into(),
+        probes: vec![ProbeSpec {
+            kind: "readiness".into(),
+            handler: "http".into(),
+            path: Some("/ready".into()),
+            port: Some("8080".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let mut p = pod("web", "shop-1", "shop");
+    p.pod_ip = Some("10.0.3.14".into());
+    let g = ClusterGraph {
+        workloads: vec![w],
+        pods: vec![p],
+        lb_health: vec![LbHealth {
+            provider: "aws".into(),
+            source: Target { kind: "Ingress".into(), namespace: "web".into(), name: "edge".into() },
+            dns_name: "k8s-web-edge-1.us-east-1.elb.amazonaws.com".into(),
+            lb_name: "k8s-web-edge".into(),
+            target_groups: vec![
+                TargetGroupHealth {
+                    name: "k8s-web-shop-abc".into(),
+                    target_type: "ip".into(),
+                    port: Some(8080),
+                    health_check: "HTTP / on port traffic-port, expects 200".into(),
+                    targets: vec![
+                        TargetHealth {
+                            id: "10.0.3.14".into(),
+                            port: Some(8080),
+                            state: "unhealthy".into(),
+                            reason: Some("Target.ResponseCodeMismatch".into()),
+                            description: Some("Health checks failed with these codes: [404]".into()),
+                            resolved: Some("web/shop-1".into()),
+                        },
+                        TargetHealth {
+                            id: "10.0.9.9".into(),
+                            port: Some(8080),
+                            state: "unhealthy".into(),
+                            resolved: None,
+                            ..Default::default()
+                        },
+                    ],
+                },
+                TargetGroupHealth { name: "k8s-web-empty".into(), target_type: "ip".into(), ..Default::default() },
+            ],
+            error: None,
+        }],
+        ..Default::default()
+    };
+    let i = find(&g, "lb-targets-unhealthy");
+    assert_eq!(i.severity, Severity::Critical);
+    assert!(i.suggestion.contains("/ready"), "{}", i.suggestion);
+    assert!(i.evidence.iter().any(|e| e.contains("[404]")));
+    assert_eq!(i.pods, vec!["shop-1"]);
+    find(&g, "lb-stale-targets");
+    find(&g, "lb-no-targets");
+}
+
+#[test]
+fn gke_backend_health_annotation() {
+    let g = ClusterGraph {
+        ingresses: vec![IngressInfo {
+            namespace: "web".into(),
+            name: "edge".into(),
+            addresses: vec!["34.1.2.3".into()],
+            gce_backends: vec![
+                ("k8s1-abc-web-shop-80".into(), "UNHEALTHY".into()),
+                ("k8s1-abc-default-backend".into(), "HEALTHY".into()),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let i = find(&g, "lb-gce-unhealthy");
+    assert_eq!(i.severity, Severity::Warning);
+    assert!(i.suggestion.contains("readiness probe"));
+}
+
+#[test]
+fn cni_agent_and_ip_exhaustion() {
+    let mut agent = pod("kube-system", "aws-node-x", "aws-node");
+    agent.workload = Some(workload_id("DaemonSet", "kube-system", "aws-node"));
+    agent.ready = false;
+    agent.node = Some("node-b".into());
+    let mut stuck = pod("web", "shop-9", "shop");
+    stuck.phase = "Pending".into();
+    stuck.ready = false;
+    stuck.node = Some("node-b".into());
+    let g = ClusterGraph {
+        workloads: vec![
+            workload("kube-system", "aws-node", "DaemonSet", 3, 2),
+            workload("kube-system", "kube-proxy", "DaemonSet", 3, 3),
+        ],
+        pods: vec![agent, stuck],
+        nodes: vec![NodeInfo { name: "node-c".into(), ready: true, network_unavailable: true, ..Default::default() }],
+        events: vec![EventInfo {
+            namespace: "web".into(),
+            kind: "Pod".into(),
+            name: "shop-9".into(),
+            type_: "Warning".into(),
+            reason: "FailedCreatePodSandBox".into(),
+            message: "plugin type=\"aws-cni\" failed (add): add cmd: failed to assign an IP address to container"
+                .into(),
+            count: 12,
+            last_seen: None,
+        }],
+        ..Default::default()
+    };
+    let a = find(&g, "cni-agent-unready");
+    assert_eq!(a.category, Category::Cni);
+    assert!(a.detail.contains("node-b"));
+    assert!(a.suggestion.contains("AmazonEKS_CNI_Policy"));
+    assert!(!ids(&g).iter().any(|i| i.starts_with("kubeproxy-")));
+    let ip = find(&g, "cni-ip-exhausted");
+    assert!(ip.suggestion.contains("prefix delegation"));
+    find(&g, "cni-node-network");
+}
+
+#[test]
+fn probe_configuration_rules() {
+    let mut w = workload("web", "api", "Deployment", 2, 1);
+    let http = |kind: &str, port: &str, timeout: i32| ProbeSpec {
+        kind: kind.into(),
+        handler: "http".into(),
+        path: Some("/health".into()),
+        port: Some(port.into()),
+        timeout,
+        period: 10,
+        failure_threshold: 3,
+        ..Default::default()
+    };
+    w.containers = vec![ContainerSpecInfo {
+        name: "api".into(),
+        ports: vec![ContainerPortInfo { name: Some("http".into()), port: 8080, protocol: "TCP".into() }],
+        probes: vec![http("liveness", "http", 1), http("readiness", "http", 1), http("startup", "admin", 1)],
+        ..Default::default()
+    }];
+    let mut p = pod("web", "api-1", "api");
+    p.restarts = 4;
+    let g = ClusterGraph {
+        workloads: vec![w],
+        pods: vec![p],
+        events: vec![EventInfo {
+            namespace: "web".into(),
+            kind: "Pod".into(),
+            name: "api-1".into(),
+            type_: "Warning".into(),
+            reason: "Unhealthy".into(),
+            message: "Liveness probe failed: Get \"http://10.0.1.5:8080/health\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)".into(),
+            count: 20,
+            last_seen: None,
+        }],
+        ..Default::default()
+    };
+    let undefined = find(&g, "probe-port-undefined");
+    assert!(undefined.title.contains("admin"));
+    let t = find(&g, "probe-timeout");
+    assert!(t.title.contains("liveness") && t.title.contains("1s"), "{}", t.title);
+    find(&g, "probe-liveness-equals-readiness");
+    assert_eq!(t.category, Category::Runtime);
+}
+
+#[test]
+fn network_test_plan_and_probe_specs_from_json() {
+    let raw = RawSnapshot {
+        nodes: ["node-a", "node-b"]
+            .iter()
+            .map(|n| {
+                from(json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": n},
+                "spec": {"providerID": format!("aws:///us-east-1a/i-{n}")},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}}))
+            })
+            .collect(),
+        deployments: vec![from(
+            json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "api", "namespace": "web"},
+            "spec": {"selector": {"matchLabels": {"app": "api"}}, "template": {"metadata": {"labels": {"app": "api"}},
+                "spec": {"containers": [{"name": "api", "ports": [{"name": "http", "containerPort": 8080}],
+                    "readinessProbe": {"httpGet": {"path": "/ready", "port": "http"}, "timeoutSeconds": 2},
+                    "livenessProbe": {"tcpSocket": {"port": 8080}}}]}}}}),
+        )],
+        replicasets: vec![from(
+            json!({"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {"name": "api-7d", "namespace": "web",
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "api", "uid": "u", "controller": true}]},
+            "spec": {"selector": {"matchLabels": {"app": "api"}}}}),
+        )],
+        pods: vec![from(
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "api-7d-x", "namespace": "web", "labels": {"app": "api"},
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api-7d", "uid": "u", "controller": true}]},
+            "spec": {"nodeName": "node-a", "containers": [{"name": "api", "ports": [{"name": "http", "containerPort": 8080}]}]},
+            "status": {"phase": "Running", "podIP": "10.0.1.5", "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"name": "api", "image": "api", "imageID": "", "ready": true, "restartCount": 0, "state": {"running": {}}}]}}),
+        )],
+        services: vec![from(
+            json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "api", "namespace": "web"},
+            "spec": {"clusterIP": "10.100.4.4", "selector": {"app": "api"}, "ports": [{"port": 80, "targetPort": "http"}]}}),
+        )],
+        ..Default::default()
+    };
+    let g = build_graph(&raw, "t");
+    assert_eq!(g.nodes[0].instance_id.as_deref(), Some("i-node-a"));
+    let probes = &g.workloads[0].containers[0].probes;
+    assert_eq!(probes.len(), 2);
+    assert_eq!(probes.iter().find(|p| p.kind == "readiness").unwrap().path.as_deref(), Some("/ready"));
+
+    let plan = tessera_core::active::plan(
+        &g,
+        &tessera_core::active::NetworkTestRequest {
+            namespace: "web".into(),
+            service: "api".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let labels: Vec<&str> = plan.checks.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"service IP port 80"), "{labels:?}");
+    assert!(labels.contains(&"pod api-7d-x port 8080"), "{labels:?}");
+    assert!(labels.iter().any(|l| l.starts_with("readiness probe /ready")), "{labels:?}");
+    assert_eq!(plan.probes.len(), 2);
+    assert_eq!(plan.probes[0].placement, "same-node");
+    assert_eq!(plan.probes[0].node.as_deref(), Some("node-a"));
+    assert_eq!(plan.probes[1].node.as_deref(), Some("node-b"));
+    let script = plan.probes[0].manifest["spec"]["containers"][0]["command"][2].as_str().unwrap();
+    assert!(script.contains("tcp 'service IP port 80' '10.100.4.4' 80 3"));
+}

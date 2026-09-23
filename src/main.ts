@@ -7,15 +7,16 @@ import "./styles.css";
 
 import * as api from "./api";
 import { buildRows, health, podClass, renderMap, tkey, type Row } from "./map";
-import type { Category, ClusterGraph, Issue, PodInfo } from "./types";
+import type { Category, ClusterGraph, Issue, NetworkTestReport, PodInfo, Settings, TestPlan } from "./types";
 import { ago, clip, esc, fmtBytes, fmtCpu, SYSTEM_NS, toast } from "./util";
 
-type View = "map" | "issues" | "workloads" | "events";
+type View = "map" | "issues" | "workloads" | "events" | "settings";
 const VIEWS: [View, string, string][] = [
   ["map", "Traffic map", "Every path from an entry point to the node a pod runs on. Select anything to inspect it."],
   ["issues", "Issues", "Problems found in this snapshot, each traced through the layers a request passes."],
   ["workloads", "Workloads", "Deployments, StatefulSets, DaemonSets and their pods."],
   ["events", "Warning events", "Recent Warning events reported by the cluster."],
+  ["settings", "Settings", "Optional checks that go beyond reading the Kubernetes API. All are off until you turn them on."],
 ];
 const MAX_ROWS = 200;
 const REFRESH_MS = 15000;
@@ -25,7 +26,13 @@ const store = {
   set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
 };
 
+const DEFAULT_SETTINGS: Settings = { cloudChecks: false, awsProfile: "", awsRegion: "", probeImage: "", clusterDomain: "" };
+function loadSettings(): Settings {
+  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(store.get("tessera.settings") ?? "{}") }; } catch { return { ...DEFAULT_SETTINGS }; }
+}
+
 const S = {
+  settings: loadSettings(),
   contexts: [] as string[],
   ctx: "",
   g: null as ClusterGraph | null,
@@ -61,7 +68,7 @@ function shell() {
       <div class="side-foot">
         <label class="check" style="padding:0"><input type="checkbox" id="auto"> Refresh every 15 seconds</label>
         <span id="fresh"></span>
-        <span>Read-only. Tessera never changes your cluster.</span>
+        <span>Read-only. The only exception is a network test you approve.</span>
       </div>
     </aside>
     <main>
@@ -104,11 +111,12 @@ function render() {
     v.innerHTML = `<div class="panel empty"><h2>No clusters to show yet</h2><p>${esc(S.setupError)}</p><p>Tessera uses the same kubeconfig as kubectl. Once <span class="mono">kubectl get pods</span> works in your terminal, select Refresh.</p></div>`;
     return;
   }
+  if (S.view === "settings") { viewSettings(); return; }
   if (!S.g) {
     v.innerHTML = S.loading ? `<div class="panel empty"><span class="spin"></span> Reading ${esc(S.ctx)}…</div>` : `<div class="panel empty"><h2>Couldn't read ${esc(S.ctx)}</h2><p>Check that your credentials are current (for example, run <span class="mono">aws sso login</span> or <span class="mono">gcloud auth login</span>), then select Refresh.</p></div>`;
     return;
   }
-  ({ map: viewMap, issues: viewIssues, workloads: viewWorkloads, events: viewEvents })[S.view]();
+  ({ map: viewMap, issues: viewIssues, workloads: viewWorkloads, events: viewEvents, settings: viewSettings })[S.view]();
 }
 
 /* ---------------- Views ---------------- */
@@ -265,9 +273,114 @@ function viewEvents() {
     : `<div class="panel empty"><h2>No warning events</h2><p>The cluster hasn't reported any Warning events in these namespaces recently.</p></div>`;
 }
 
+function viewSettings() {
+  const st = S.settings;
+  $("#view").innerHTML = `<div class="panel pad settings">
+    <h2>Cloud load balancer health</h2>
+    <p class="muted">Asks your cloud which load balancer targets are healthy, and explains why the rest fail. On AWS, Tessera runs read-only <span class="mono">aws elbv2 describe-*</span> and <span class="mono">aws elb describe-*</span> commands with the aws CLI you already use for EKS. It needs <span class="mono">elasticloadbalancing:Describe*</span> permissions and never stores credentials. GKE backend health is read from the ingress without any cloud call. Azure isn't supported yet.</p>
+    <label class="check" style="padding:0"><input type="checkbox" id="set-cloud" ${st.cloudChecks ? "checked" : ""}> Check cloud load balancer target health on every refresh</label>
+    <div class="grid2">
+      <label class="field" style="padding:0">AWS profile <input id="set-profile" value="${esc(st.awsProfile)}" placeholder="From your kubeconfig"></label>
+      <label class="field" style="padding:0">AWS region <input id="set-region" value="${esc(st.awsRegion)}" placeholder="From the load balancer name"></label>
+    </div>
+    <h2 class="gap">Network tests</h2>
+    <p class="muted">Open a service and choose <b>Test connectivity</b>. Tessera shows you the exact probe pods it would create and runs nothing until you approve. The pods are non-root, have no service account token, and are deleted when the test ends (at most 90 seconds).</p>
+    <div class="grid2">
+      <label class="field" style="padding:0">Probe image <input id="set-image" value="${esc(st.probeImage)}" placeholder="busybox:1.36.1"><small>Use a mirror if your cluster can't pull from Docker Hub.</small></label>
+      <label class="field" style="padding:0">Cluster domain <input id="set-domain" value="${esc(st.clusterDomain)}" placeholder="cluster.local"></label>
+    </div>
+    <div class="row gap"><button class="btn primary" id="set-save">Save settings</button></div>
+  </div>`;
+}
+
+function saveSettings() {
+  const v = (id: string) => ($(id) as HTMLInputElement).value.trim();
+  const before = S.settings.cloudChecks;
+  S.settings = {
+    cloudChecks: ($("#set-cloud") as HTMLInputElement).checked,
+    awsProfile: v("#set-profile"), awsRegion: v("#set-region"), probeImage: v("#set-image"), clusterDomain: v("#set-domain"),
+  };
+  store.set("tessera.settings", JSON.stringify(S.settings));
+  toast("Settings saved");
+  if (S.settings.cloudChecks !== before || S.settings.cloudChecks) refresh();
+}
+
+/* ---------------- Network test ---------------- */
+
+let netPlan: { id: string; plan: TestPlan } | null = null;
+
+function drawerShell(h: string) {
+  $("#overlay").innerHTML = `<div class="scrim" data-close></div><aside class="drawer" role="dialog" aria-modal="true" aria-label="Details"><button class="close" data-close aria-label="Close">×</button>${h}</aside>`;
+  $(".drawer .close").focus();
+}
+
+async function planTest(ns: string, name: string, source?: string) {
+  drawerShell(`<h2>Test connectivity to ${esc(name)}</h2><p class="muted"><span class="spin"></span> Working out what to test…</p>`);
+  try {
+    netPlan = await api.planNetworkTest(S.ctx, ns, name, source ?? ns, S.settings);
+    showPlan();
+  } catch (e) {
+    drawerShell(`<h2>Test connectivity to ${esc(name)}</h2><div class="notice bad">${esc(String(e))}</div>`);
+  }
+}
+
+function showPlan() {
+  const { plan } = netPlan!;
+  const ns = plan.service.namespace;
+  const byKind = (k: string) => plan.checks.filter((c) => c.kind === k).length;
+  drawerShell(`<h2>Test connectivity to ${esc(plan.service.name)}</h2>
+    <p class="muted" style="margin:4px 0 14px">Nothing has been created yet. Review the plan, then run it.</p>
+    <dl>
+      <dt>Probes from</dt><dd><input id="nt-src" value="${esc(plan.sourceNamespace)}" class="mono" style="width:100%;border:1px solid var(--line);border-radius:6px;padding:3px 6px;background:var(--panel2)"><small class="muted">Namespace the probes run in. Try the namespace of a client that can't connect.</small></dd>
+      <dt>Probe pods</dt><dd>${plan.probes.map((p) => `${esc(p.placement.replace("-", " "))}${p.node ? ` on <span class="mono">${esc(p.node)}</span>` : ""}`).join("<br>")}</dd>
+      <dt>Checks</dt><dd>${byKind("dns")} DNS, ${byKind("tcp")} TCP, ${byKind("http")} health endpoint</dd>
+      <dt>Image</dt><dd class="mono">${esc(plan.image)}</dd>
+    </dl>
+    <ul class="plist">${plan.checks.map((c) => `<li><span>${esc(c.label)}</span><span class="mono muted">${esc(c.port ? `${c.host}:${c.port}${c.path ?? ""}` : c.host)}</span></li>`).join("")}</ul>
+    ${plan.notes.map((n) => `<p class="muted" style="font-size:13px">${esc(n)}</p>`).join("")}
+    <details class="gap"><summary>Exact pods that will be created</summary><pre class="ev">${esc(plan.probes.map((p) => JSON.stringify(p.manifest, null, 2)).join("\n---\n"))}</pre></details>
+    <div class="row gap"><button class="btn primary" id="nt-run">Run test: create ${plan.probes.length} probe ${plan.probes.length === 1 ? "pod" : "pods"}</button><button class="btn" id="nt-replan" data-ns="${esc(ns)}" data-name="${esc(plan.service.name)}">Re-plan</button><button class="btn" data-close>Cancel</button></div>`);
+}
+
+async function runTest() {
+  if (!netPlan) return;
+  const { id, plan } = netPlan;
+  netPlan = null;
+  drawerShell(`<h2>Testing ${esc(plan.service.name)}</h2><p><span class="spin"></span> Probe pods are running. This usually takes 10 to 30 seconds, and they're deleted afterwards.</p>`);
+  try {
+    showReport(await api.runNetworkTest(id, plan));
+  } catch (e) {
+    drawerShell(`<h2>Testing ${esc(plan.service.name)}</h2><div class="notice bad">${esc(String(e))}</div>`);
+  }
+}
+
+function showReport(r: NetworkTestReport) {
+  const ICON = { ok: "✓", warning: "!", critical: "✕" } as const;
+  const cls = { ok: "ok", warning: "warn", critical: "bad" } as const;
+  const resCls = (x: string) => (x === "ok" || /^[23]\d\d$/.test(x) ? "ok" : x === "refused" || /^\d{3}$/.test(x) ? "warn" : "bad");
+  drawerShell(`<h2>Connectivity to ${esc(r.plan.service.name)}</h2>
+    <p class="muted" style="margin:4px 0 14px">From ${esc(r.plan.sourceNamespace)}. Probe pods have been deleted.</p>
+    <div class="layers">${r.findings.map((f) => `<div class="layer" style="grid-template-columns:26px minmax(0,1fr)"><span class="ic ${cls[f.status]}">${ICON[f.status]}</span><div><b>${esc(f.title)}</b><br>${esc(f.detail)}<p class="fix" style="margin:8px 0 0">${esc(f.suggestion)}</p></div></div>`).join("")}</div>
+    ${r.runs.map((run) => `<h3 class="gap">From ${esc(run.placement.replace("-", " "))}${run.node ? `, ${esc(run.node)}` : ""}</h3>
+      ${run.error ? `<div class="notice">${esc(run.error)}</div>` : ""}
+      <ul class="plist">${run.results.map((x) => `<li><span>${esc(x.label)}</span><span class="st ${resCls(x.result)}">${esc(x.result)} <span class="muted mono">${esc(x.detail)}</span></span></li>`).join("")}</ul>`).join("")}
+    <div class="row gap"><button class="btn" data-nettest="${esc(`${r.plan.service.namespace}/${r.plan.service.name}`)}">Run again</button></div>`);
+}
+
 /* ---------------- Drawer ---------------- */
 
 let drawerPod: PodInfo | null = null;
+
+function lbHealthHtml(kind: string, ns: string, name: string): string {
+  const hs = (S.g?.lbHealth ?? []).filter((h) => h.source.kind === kind && h.source.namespace === ns && h.source.name === name);
+  if (!hs.length) {
+    return S.settings.cloudChecks ? "" : `<p class="muted" style="font-size:13px">Turn on cloud checks in Settings to see this load balancer's target health.</p>`;
+  }
+  return hs.map((h) => `<h3 class="gap">Load balancer targets</h3><p class="muted mono" style="font-size:12px;margin:0 0 6px">${esc(h.lbName || h.dnsName)}</p>
+    ${h.error ? `<div class="notice">${esc(h.error)}</div>` : ""}
+    ${h.targetGroups.map((tg) => `<p style="margin:10px 0 4px"><b>${esc(tg.name)}</b> <span class="muted">${esc(tg.healthCheck)}</span></p>
+      <ul class="plist">${tg.targets.map((t) => `<li><span class="mono">${esc(t.id)}${t.port ? `:${t.port}` : ""}${t.resolved ? ` <span class="muted">${esc(t.resolved)}</span>` : ""}</span><span class="st ${t.state === "healthy" ? "ok" : t.state === "unhealthy" || t.state === "unavailable" ? "bad" : "warn"}">${esc(t.state)}${t.reason ? ` <span class="muted">${esc(t.reason)}</span>` : ""}</span></li>`).join("") || '<li class="muted">No registered targets.</li>'}</ul>`).join("")}`).join("");
+}
 
 function relatedIssues(match: (i: Issue) => boolean): string {
   const list = (S.g?.issues ?? []).filter(match);
@@ -293,6 +406,7 @@ function openDrawer(kind: string, id: string) {
     h = `<h2>${esc(ing.name)}</h2><p class="muted" style="margin:4px 0 0">Ingress in ${esc(ns)}</p>
       <dl><dt>Class</dt><dd>${esc(ing.className ?? "default")}</dd><dt>Address</dt><dd class="mono">${esc(ing.addresses.join(", ") || "not assigned yet")}</dd></dl>
       <h3>Routes</h3><ul class="plist">${ing.routes.map((r) => `<li><span class="mono">${esc(`${r.host ?? "*"}${r.path}`)}</span>${svcs.has(r.service) ? `<button class="linkbtn" data-kind="service" data-id="${esc(tkey("Service", ns, r.service))}">${esc(r.service)}</button>` : `<span class="st bad">${esc(r.service)} missing</span>`}</li>`).join("")}</ul>
+      ${lbHealthHtml("Ingress", ns, name)}
       ${relatedIssues((i) => i.target.kind === "Ingress" && i.target.namespace === ns && i.target.name === name)}`;
   } else if (kind === "service" || kind === "missing") {
     const s = g.services.find((x) => tkey("Service", x.namespace, x.name) === id);
@@ -306,6 +420,7 @@ function openDrawer(kind: string, id: string) {
         <dt>Cluster IP</dt><dd class="mono">${esc(s.clusterIp ?? "")}</dd><dt>Ports</dt><dd class="mono">${esc(s.ports.join(", "))}</dd>
         ${s.external.length ? `<dt>External</dt><dd class="mono">${esc(s.external.join(", "))}</dd>` : ""}
         <dt>Endpoints</dt><dd><span class="st ${s.readyEndpoints ? "ok" : "bad"}">${s.readyEndpoints} ready</span>${s.notReadyEndpoints ? `, ${s.notReadyEndpoints} not ready` : ""}</dd></dl>
+        <div class="row"><button class="btn" data-nettest="${esc(`${s.namespace}/${s.name}`)}">Test connectivity</button><span class="muted" style="font-size:13px">Shows a plan first; nothing runs until you approve.</span></div>
         ${s.workloads.length ? `<h3>Workloads</h3><ul class="plist">${s.workloads.map((w) => `<li><button class="linkbtn" data-kind="workload" data-id="${esc(w)}">${esc(w.split("/").slice(-1)[0])}</button><span class="muted">${esc(w.split("/")[0])}</span></li>`).join("")}</ul>` : ""}
         <h3 class="gap">Pods</h3>${podList(pods)}
         ${relatedIssues((i) => i.target.kind === "Service" && i.target.namespace === s.namespace && i.target.name === s.name)}`;
@@ -383,7 +498,7 @@ async function refresh() {
   renderSide();
   if (!S.g) render();
   try {
-    const g = await api.snapshot(S.ctx);
+    const g = await api.snapshot(S.ctx, S.settings);
     if (mine !== seq) return;
     S.g = g;
     S.error = "";
@@ -449,9 +564,13 @@ function toggleTheme() {
 /* ---------------- Events ---------------- */
 
 document.addEventListener("click", (e) => {
-  const t = (e.target as HTMLElement).closest<HTMLElement>("[data-view],[data-kind],[data-issue],[data-cat],[data-copy],[data-close],#refresh,#theme,#logload");
+  const t = (e.target as HTMLElement).closest<HTMLElement>("[data-view],[data-kind],[data-issue],[data-cat],[data-copy],[data-close],[data-nettest],#refresh,#theme,#logload,#set-save,#nt-run,#nt-replan");
   if (!t) return;
-  if (t.dataset.cat !== undefined) { S.selCategory = t.dataset.cat as Category | ""; render(); }
+  if (t.dataset.nettest) { const [ns, name] = t.dataset.nettest.split("/"); planTest(ns, name); }
+  else if (t.id === "set-save") saveSettings();
+  else if (t.id === "nt-run") runTest();
+  else if (t.id === "nt-replan") planTest(t.dataset.ns ?? "", t.dataset.name ?? "", ($("#nt-src") as HTMLInputElement).value.trim());
+  else if (t.dataset.cat !== undefined) { S.selCategory = t.dataset.cat as Category | ""; render(); }
   else if (t.dataset.view) go(t.dataset.view as View);
   else if (t.dataset.kind) openDrawer(t.dataset.kind, t.dataset.id ?? "");
   else if (t.dataset.issue) { closeOverlay(); S.selIssue = t.dataset.issue; go("issues"); }

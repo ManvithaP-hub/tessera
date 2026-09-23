@@ -23,6 +23,7 @@ export interface ClusterGraph {
   defaultIngressClass: string | null;
   secretNames: string[] | null;
   mesh: { installed: boolean; virtualServices: unknown[]; destinationRules: unknown[] };
+  lbHealth: LbHealth[];
   issues: Issue[];
   warnings: string[];
 }
@@ -139,4 +140,40 @@ export interface Issue {
   suggestion: string;
   commands: string[];
   pods: string[];
+}
+
+export interface TargetHealth { id: string; port: number | null; state: string; reason: string | null; description: string | null; resolved: string | null }
+export interface TargetGroupHealth { name: string; targetType: string; port: number | null; healthCheck: string; targets: TargetHealth[] }
+export interface LbHealth {
+  provider: string;
+  source: { kind: string; namespace: string; name: string };
+  dnsName: string;
+  lbName: string;
+  targetGroups: TargetGroupHealth[];
+  error: string | null;
+}
+
+export interface Settings {
+  cloudChecks: boolean;
+  awsProfile: string;
+  awsRegion: string;
+  probeImage: string;
+  clusterDomain: string;
+}
+
+export interface PlannedCheck { kind: string; label: string; host: string; port: number | null; path: string | null; timeout: number; targetNode: string | null }
+export interface TestPlan {
+  service: { kind: string; namespace: string; name: string };
+  sourceNamespace: string;
+  image: string;
+  checks: PlannedCheck[];
+  probes: { node: string | null; placement: string; manifest: unknown }[];
+  policiesApply: boolean;
+  notes: string[];
+}
+export interface CheckResult { kind: string; label: string; target: string; result: string; detail: string }
+export interface NetworkTestReport {
+  plan: TestPlan;
+  runs: { node: string | null; placement: string; results: CheckResult[]; error: string | null }[];
+  findings: { status: "critical" | "warning" | "ok"; title: string; detail: string; suggestion: string }[];
 }

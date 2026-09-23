@@ -29,6 +29,8 @@ pub struct ClusterGraph {
     /// `None` means we couldn't check, so secret-based rules stay quiet.
     pub secret_names: Option<Vec<String>>,
     pub mesh: MeshInfo,
+    /// Cloud load balancer target health; empty unless cloud checks are on.
+    pub lb_health: Vec<LbHealth>,
     pub issues: Vec<Issue>,
     /// Non-fatal problems while collecting, such as RBAC denials.
     pub warnings: Vec<String>,
@@ -45,6 +47,10 @@ pub struct NodeInfo {
     pub memory_allocatable_bytes: i64,
     /// Conditions such as MemoryPressure that are currently True.
     pub pressure: Vec<String>,
+    /// NetworkUnavailable condition is True (CNI hasn't configured the node).
+    pub network_unavailable: bool,
+    /// Cloud instance id parsed from spec.providerID, e.g. i-0abc123.
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -56,6 +62,8 @@ pub struct IngressInfo {
     pub addresses: Vec<String>,
     pub routes: Vec<Route>,
     pub tls_secrets: Vec<String>,
+    /// GKE ingress-gce `ingress.kubernetes.io/backends`: backend -> health.
+    pub gce_backends: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -110,6 +118,62 @@ pub struct ContainerSpecInfo {
     pub cpu_request_milli: Option<i64>,
     pub memory_request_bytes: Option<i64>,
     pub memory_limit_bytes: Option<i64>,
+    pub ports: Vec<ContainerPortInfo>,
+    pub probes: Vec<ProbeSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeSpec {
+    /// liveness, readiness or startup
+    pub kind: String,
+    /// http, tcp, grpc or exec
+    pub handler: String,
+    pub path: Option<String>,
+    /// Number or port name.
+    pub port: Option<String>,
+    pub scheme: Option<String>,
+    pub initial_delay: i32,
+    pub timeout: i32,
+    pub period: i32,
+    pub failure_threshold: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LbHealth {
+    pub provider: String,
+    /// The Ingress or Service that owns this load balancer.
+    pub source: Target,
+    pub dns_name: String,
+    pub lb_name: String,
+    pub target_groups: Vec<TargetGroupHealth>,
+    /// Set when the cloud couldn't be queried; the rest is then empty.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetGroupHealth {
+    pub name: String,
+    pub target_type: String,
+    pub port: Option<i32>,
+    /// e.g. "HTTP /healthz on traffic-port, expects 200"
+    pub health_check: String,
+    pub targets: Vec<TargetHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetHealth {
+    pub id: String,
+    pub port: Option<i32>,
+    /// healthy, unhealthy, initial, draining, unused, unavailable
+    pub state: String,
+    pub reason: Option<String>,
+    pub description: Option<String>,
+    /// `namespace/pod` or `node:name` when the target maps to something we know.
+    pub resolved: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -311,6 +375,8 @@ pub enum Category {
     Network,
     Dns,
     Mesh,
+    /// Pod networking: CNI plugin and kube-proxy.
+    Cni,
     Image,
     Config,
     Storage,
@@ -338,6 +404,8 @@ impl Category {
             r if r.starts_with("np-") => Category::Network,
             r if r.starts_with("dns-") => Category::Dns,
             r if r.starts_with("mesh-") => Category::Mesh,
+            r if r.starts_with("cni-") || r.starts_with("kubeproxy-") => Category::Cni,
+            r if r.starts_with("probe-") => Category::Runtime,
             "pod-imagepull" => Category::Image,
             "pod-config" | "config-missing" | "admission-denied" => Category::Config,
             r if r.starts_with("storage-") => Category::Storage,
@@ -351,7 +419,7 @@ impl Category {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
     pub kind: String,

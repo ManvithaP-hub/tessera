@@ -1,7 +1,7 @@
 // A small, deterministic demo cluster used when running outside Tauri.
 // Its issues mirror what tessera-core produces for the same state.
 
-import type { ClusterGraph, Contexts, Issue, PodInfo, ServiceInfo, WorkloadInfo } from "./types";
+import type { ClusterGraph, Contexts, Issue, LbHealth, NetworkTestReport, PodInfo, ServiceInfo, TestPlan, WorkloadInfo } from "./types";
 
 export const demoContexts: Contexts = {
   current: "demo-shop",
@@ -58,7 +58,7 @@ function svc(w: WorkloadInfo, ps: PodInfo[], selector = w.name): ServiceInfo {
   };
 }
 
-export function demoGraph(context: string): ClusterGraph {
+export function demoGraph(context: string, cloud = false): ClusterGraph {
   const store = wl("web", "storefront", 3, 3, 500, 512);
   const checkout = wl("web", "checkout", 2, 1, 250, 384);
   const pay = wl("payments", "payments-api", 3, 1, 500, 256);
@@ -170,7 +170,16 @@ export function demoGraph(context: string): ClusterGraph {
     ],
     namespaces: [], networkPolicies: [], pvcs: [], hpas: [], ingressClasses: ["alb"], defaultIngressClass: "alb",
     secretNames: null, mesh: { installed: false, virtualServices: [], destinationRules: [] },
-    issues,
+    lbHealth: cloud ? demoLb(P.store) : [],
+    issues: cloud ? [...issues, {
+      id: "lb-targets-unhealthy:web/shop-edge/k8s-web-storefro-8a1c", severity: "warning", layer: "entry", category: "routing",
+      target: { kind: "Ingress", namespace: "web", name: "shop-edge" },
+      title: "1 of 3 load balancer targets are unhealthy in k8s-web-storefro-8a1c",
+      detail: "Some targets fail the load balancer's health check and receive no traffic, reducing capacity.",
+      evidence: ["health check: HTTP / on port traffic-port, expects 200", `${P.store[2].podIp}:8080 (web/${P.store[2].name}): unhealthy Target.ResponseCodeMismatch: Health checks failed with these codes: [503]`],
+      suggestion: "The health check reaches the pods but gets the wrong HTTP status (HTTP / on port traffic-port, expects 200). Make that path return a success code, or point the health check at one that does (AWS Load Balancer Controller: the alb.ingress.kubernetes.io/healthcheck-path annotation).",
+      commands: ["aws elbv2 describe-target-health --target-group-arn <arn>"], pods: [P.store[2].name],
+    } as Issue] : issues,
     warnings: [],
   };
 }
@@ -187,4 +196,64 @@ export function demoLogs(pod: string, previous: boolean): string {
   }
   if (pod.startsWith("catalog")) return Array.from({ length: 6 }, (_, i) => `${t(60 - i * 10)} INFO  GET /healthz 200 1ms`).join("\n");
   return Array.from({ length: 8 }, (_, i) => `${t(80 - i * 9)} INFO  GET /${i % 2 ? "products/42" : ""} 200 ${8 + i * 3}ms`).join("\n");
+}
+
+function demoLb(store: PodInfo[]): LbHealth[] {
+  return [{
+    provider: "aws", source: { kind: "Ingress", namespace: "web", name: "shop-edge" },
+    dnsName: "k8s-shopedge-7f3a9c.us-east-1.elb.amazonaws.com", lbName: "k8s-shopedge-7f3a9c",
+    targetGroups: [{
+      name: "k8s-web-storefro-8a1c", targetType: "ip", port: 8080, healthCheck: "HTTP / on port traffic-port, expects 200",
+      targets: store.map((p, i) => ({
+        id: p.podIp ?? "", port: 8080, state: i === 2 ? "unhealthy" : "healthy",
+        reason: i === 2 ? "Target.ResponseCodeMismatch" : null, description: i === 2 ? "Health checks failed with these codes: [503]" : null,
+        resolved: `${p.namespace}/${p.name}`,
+      })),
+    }],
+    error: null,
+  }];
+}
+
+export function demoPlan(namespace: string, service: string, source: string, image: string): TestPlan {
+  const checks = [
+    { kind: "dns", label: "cluster DNS", host: "kubernetes.default.svc.cluster.local", port: null, path: null, timeout: 3, targetNode: null },
+    { kind: "dns", label: "service name", host: `${service}.${namespace}.svc.cluster.local`, port: null, path: null, timeout: 3, targetNode: null },
+    { kind: "tcp", label: "service IP port 80", host: "10.100.4.36", port: 80, path: null, timeout: 3, targetNode: null },
+    { kind: "tcp", label: `pod ${service}-7c9d0f5b8-x2kqp port 8080`, host: "10.0.1.70", port: 8080, path: null, timeout: 3, targetNode: nodes[1] },
+    { kind: "tcp", label: `pod ${service}-7c9d1f5b8-m8zrt port 8080`, host: "10.0.2.70", port: 8080, path: null, timeout: 3, targetNode: nodes[2] },
+    { kind: "http", label: `readiness probe /ready on pod ${service}-7c9d0f5b8-x2kqp`, host: "10.0.1.70", port: 8080, path: "/ready", timeout: 1, targetNode: nodes[1] },
+  ];
+  const manifest = (node: string) => ({
+    apiVersion: "v1", kind: "Pod",
+    metadata: { generateName: "tessera-probe-", namespace: source, labels: { "app.kubernetes.io/managed-by": "tessera", "tessera.dev/probe": "network" } },
+    spec: { nodeName: node, restartPolicy: "Never", activeDeadlineSeconds: 90, automountServiceAccountToken: false,
+      securityContext: { runAsNonRoot: true, runAsUser: 65534 },
+      containers: [{ name: "probe", image: image || "busybox:1.36.1", command: ["sh", "-c", "(checks script)"],
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } } }] },
+  });
+  return {
+    service: { kind: "Service", namespace, name: service }, sourceNamespace: source, image: image || "busybox:1.36.1", checks,
+    probes: [{ node: nodes[1], placement: "same-node", manifest: manifest(nodes[1]) }, { node: nodes[0], placement: "other-node", manifest: manifest(nodes[0]) }],
+    policiesApply: false,
+    notes: [`Probes run as pods in ${source} labelled app.kubernetes.io/managed-by=tessera. NetworkPolicies that admit only specific pod labels will treat them differently from your real clients.`],
+  };
+}
+
+export function demoReport(plan: TestPlan): NetworkTestReport {
+  const res = (other: boolean) => plan.checks.map((c) => ({
+    kind: c.kind, label: c.label, target: c.port ? `${c.host}:${c.port}${c.path ?? ""}` : c.host,
+    result: c.kind === "dns" ? "ok" : c.kind === "http" ? "503" : other && c.targetNode === nodes[2] ? "timeout" : "ok",
+    detail: c.kind === "dns" ? "10.100.4.36" : other && c.targetNode === nodes[2] ? "3s" : "0s",
+  }));
+  return {
+    plan,
+    runs: [{ node: nodes[1], placement: "same-node", results: res(false), error: null }, { node: nodes[0], placement: "other-node", results: res(true), error: null }],
+    findings: [
+      { status: "critical", title: "Cross-node traffic to 10.0.2.70:8080 is dropped",
+        detail: `pod ${plan.service.name}-7c9d1f5b8-m8zrt port 8080 answers from its own node but times out from ${nodes[0]}. Pod networking between nodes is broken, which is a CNI or node firewall problem, not the app.`,
+        suggestion: "Check the CNI agent pods on both nodes (aws-node, calico-node, cilium) and that node security groups allow node-to-node traffic, including the overlay port if you use one (VXLAN UDP 4789 or 8472)." },
+      { status: "warning", title: `readiness probe /ready on pod ${plan.service.name}-7c9d0f5b8-x2kqp returns HTTP 503`,
+        detail: "GET 10.0.1.70:8080/ready took 0s.", suggestion: "The kubelet treats anything outside 200-399 as a failure. Fix the endpoint or point the probe at a path that reports health." },
+    ],
+  };
 }

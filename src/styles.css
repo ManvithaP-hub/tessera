@@ -150,3 +150,8 @@ pre.ev { background: var(--code); color: var(--codetext); font: 12px/1.6 var(--m
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 .chip[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .chip[data-cat]:hover { border-color: var(--accent); }
+.settings input:not([type]) , .settings input[id^="set-"]:not([type="checkbox"]) { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 14px; color: var(--text); }
+.settings .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 12px; }
+.settings p { max-width: 75ch; }
+details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+@media (max-width: 900px) { .settings .grid2 { grid-template-columns: 1fr; } }

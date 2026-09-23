@@ -12,6 +12,14 @@ First public release.
   sidecars, destinations and subsets), images, config and admission policies,
   storage, scheduling, quotas, autoscaling, crashes and probes, and nodes.
 - Issues view can be filtered by category.
+- Cloud load balancer target health for AWS (opt-in), and GKE backend health.
+- Network tests you approve: probe pods on two nodes separate DNS, kube-proxy,
+  CNI, NetworkPolicy and app faults, and call the pods' health endpoints.
+- Pod networking checks: CNI agents and kube-proxy, NetworkUnavailable, VPC CNI
+  IP exhaustion.
+- Probe checks: undefined probe ports, timeouts, liveness equal to readiness,
+  missing startup probes.
+- Settings view.
 - Each issue shows the request path, evidence, a suggested fix and read-only
   kubectl commands to confirm it.
 - Pod logs, including the previous container.
