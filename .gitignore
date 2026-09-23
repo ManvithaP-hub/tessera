@@ -4,3 +4,12 @@ target/
 src-tauri/gen/
 .DS_Store
 *.log
+
+# Never commit credentials or cluster access files
+.env
+.env.*
+*.kubeconfig
+kubeconfig*
+*.pem
+*.key
+.aws/
