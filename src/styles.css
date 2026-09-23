@@ -148,3 +148,5 @@ pre.ev { background: var(--code); color: var(--codetext); font: 12px/1.6 var(--m
 
 @media (max-width: 1000px) { .issues { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+.chip[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.chip[data-cat]:hover { border-color: var(--accent); }

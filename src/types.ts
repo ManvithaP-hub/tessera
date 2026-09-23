@@ -15,6 +15,14 @@ export interface ClusterGraph {
   workloads: WorkloadInfo[];
   pods: PodInfo[];
   events: EventInfo[];
+  namespaces: { name: string; labels: Record<string, string> }[];
+  networkPolicies: unknown[];
+  pvcs: { namespace: string; name: string; phase: string; storageClass: string | null }[];
+  hpas: unknown[];
+  ingressClasses: string[];
+  defaultIngressClass: string | null;
+  secretNames: string[] | null;
+  mesh: { installed: boolean; virtualServices: unknown[]; destinationRules: unknown[] };
   issues: Issue[];
   warnings: string[];
 }
@@ -115,11 +123,15 @@ export interface EventInfo {
 
 export type Severity = "critical" | "warning";
 export type Layer = "entry" | "service" | "workload" | "pod" | "node";
+export type Category =
+  | "routing" | "network" | "dns" | "mesh" | "image" | "config" | "storage"
+  | "scheduling" | "capacity" | "scaling" | "runtime" | "node" | "other";
 
 export interface Issue {
   id: string;
   severity: Severity;
   layer: Layer;
+  category: Category;
   target: { kind: string; namespace: string; name: string };
   title: string;
   detail: string;

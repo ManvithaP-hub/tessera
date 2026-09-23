@@ -22,11 +22,10 @@ and what to change.
 - **Traffic map.** Ingress and load balancer entry points, services, workloads,
   pods and nodes, connected the way traffic actually flows. Broken hops are
   drawn in red.
-- **Diagnosis across five layers.** Tessera catches missing ingress backends,
-  service selectors that match nothing (and the labels they probably should
-  match), empty endpoints, OOMKilled crash loops with the current memory limit,
-  image pull failures (missing tag or registry auth), missing ConfigMaps and
-  Secrets, pods too large for any node, taints, and node conditions.
+- **Diagnosis across 12 categories.** Routing, network policies, cluster DNS,
+  service mesh (Istio), images, config and admission policies, storage,
+  scheduling, quotas, autoscaling, crashes and probes, and nodes. See the
+  [full list of checks](docs/architecture.md#diagnosis-rules).
 - **Root cause, not symptoms.** Pod findings are grouped per workload, and a
   service with no endpoints is marked as a symptom when its pods explain why.
 - **Evidence you can check.** Every issue lists what was observed and the
@@ -91,9 +90,9 @@ to add a diagnosis rule.
 ## Roadmap
 
 - Watch-based live updates instead of polling
-- Gateway API routes as entry points
-- More rules: failing liveness probes, PVC and storage issues, HPA at max,
-  NetworkPolicy blocks, cloud load balancer target health
+- Optional probes for what the API can't show: cloud load balancer target
+  health (AWS, GCP, Azure), in-cluster DNS lookups, and pod-to-pod reachability
+- Gateway API, Linkerd and Traefik routes
 - Optional AI explanation of an issue using a model you choose (your own API
   key, Amazon Bedrock in your account, or a local model), off by default
 - Signed and notarized builds

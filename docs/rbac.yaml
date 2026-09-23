@@ -15,7 +15,7 @@ metadata:
   name: tessera-viewer
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "pods", "services", "events"]
+    resources: ["nodes", "pods", "services", "events", "namespaces", "persistentvolumeclaims"]
     verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods/log"]
@@ -27,5 +27,19 @@ rules:
     resources: ["endpointslices"]
     verbs: ["get", "list"]
   - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
+    resources: ["ingresses", "ingressclasses", "networkpolicies"]
     verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  # Optional: Istio routing checks. Harmless if Istio isn't installed.
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices", "destinationrules"]
+    verbs: ["get", "list"]
+  # Optional: lets Tessera check that ingress TLS secrets exist. Tessera
+  # requests metadata only (names), never secret contents, but Kubernetes RBAC
+  # can't grant "names only", so leave this out if that's a concern. The TLS
+  # check is simply skipped without it.
+  # - apiGroups: [""]
+  #   resources: ["secrets"]
+  #   verbs: ["list"]

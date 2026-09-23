@@ -18,6 +18,17 @@ pub struct ClusterGraph {
     pub workloads: Vec<WorkloadInfo>,
     pub pods: Vec<PodInfo>,
     pub events: Vec<EventInfo>,
+    pub namespaces: Vec<NamespaceInfo>,
+    pub network_policies: Vec<NetworkPolicyInfo>,
+    pub pvcs: Vec<PvcInfo>,
+    pub hpas: Vec<HpaInfo>,
+    /// Names of IngressClasses, and which one is the default.
+    pub ingress_classes: Vec<String>,
+    pub default_ingress_class: Option<String>,
+    /// `namespace/name` of Secrets, when the user may list their metadata.
+    /// `None` means we couldn't check, so secret-based rules stay quiet.
+    pub secret_names: Option<Vec<String>>,
+    pub mesh: MeshInfo,
     pub issues: Vec<Issue>,
     /// Non-fatal problems while collecting, such as RBAC denials.
     pub warnings: Vec<String>,
@@ -44,6 +55,7 @@ pub struct IngressInfo {
     pub class_name: Option<String>,
     pub addresses: Vec<String>,
     pub routes: Vec<Route>,
+    pub tls_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -65,6 +77,7 @@ pub struct ServiceInfo {
     pub cluster_ip: Option<String>,
     pub selector: BTreeMap<String, String>,
     pub ports: Vec<String>,
+    pub ports_detail: Vec<ServicePortInfo>,
     pub external: Vec<String>,
     pub ready_endpoints: u32,
     pub not_ready_endpoints: u32,
@@ -116,6 +129,129 @@ pub struct PodInfo {
     pub pod_ip: Option<String>,
     pub created: Option<String>,
     pub containers: Vec<ContainerStatusInfo>,
+    /// Init containers, including native sidecars such as istio-proxy.
+    pub init_containers: Vec<String>,
+    pub container_ports: Vec<ContainerPortInfo>,
+    pub pvcs: Vec<String>,
+    /// Pod-level status message, e.g. why it was evicted.
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerPortInfo {
+    pub name: Option<String>,
+    pub port: i32,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicePortInfo {
+    pub port: i32,
+    /// Number or port name, as written in the Service. Defaults to `port`.
+    pub target: String,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+/// A NetworkPolicy reduced to what the rules need. Selectors that use
+/// matchExpressions are marked `complex` and treated conservatively.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPolicyInfo {
+    pub namespace: String,
+    pub name: String,
+    pub pod_selector: BTreeMap<String, String>,
+    pub selector_complex: bool,
+    pub ingress_type: bool,
+    pub egress_type: bool,
+    pub ingress: Vec<NpRule>,
+    pub egress: Vec<NpRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NpRule {
+    /// Empty means "all peers".
+    pub peers: Vec<String>,
+    /// Empty means "all ports".
+    pub ports: Vec<NpPort>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NpPort {
+    /// Number or name; `None` means every port of the protocol.
+    pub port: Option<String>,
+    pub end_port: Option<i32>,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PvcInfo {
+    pub namespace: String,
+    pub name: String,
+    pub phase: String,
+    pub storage_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HpaInfo {
+    pub namespace: String,
+    pub name: String,
+    pub target: String,
+    pub min: i32,
+    pub max: i32,
+    pub current: i32,
+    pub desired: i32,
+    pub conditions: Vec<ConditionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionInfo {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Istio routing objects, when Istio's CRDs are installed.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshInfo {
+    pub installed: bool,
+    pub virtual_services: Vec<VirtualServiceInfo>,
+    pub destination_rules: Vec<DestinationRuleInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualServiceInfo {
+    pub namespace: String,
+    pub name: String,
+    pub hosts: Vec<String>,
+    /// (destination host, optional subset)
+    pub destinations: Vec<(String, Option<String>)>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DestinationRuleInfo {
+    pub namespace: String,
+    pub name: String,
+    pub host: String,
+    pub subsets: Vec<(String, BTreeMap<String, String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -167,6 +303,54 @@ pub enum Layer {
     Node,
 }
 
+/// What kind of problem an issue is, independent of where on the path it sits.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Category {
+    Routing,
+    Network,
+    Dns,
+    Mesh,
+    Image,
+    Config,
+    Storage,
+    Scheduling,
+    Capacity,
+    Scaling,
+    Runtime,
+    Node,
+    #[default]
+    Other,
+}
+
+impl Category {
+    /// Derived from the rule id prefix, so every rule is categorised in one place.
+    pub fn for_rule(id: &str) -> Category {
+        let rule = id.split(':').next().unwrap_or("");
+        match rule {
+            r if r.starts_with("entry-")
+                || r.starts_with("ingress-")
+                || r.starts_with("lb-")
+                || r.starts_with("svc-") =>
+            {
+                Category::Routing
+            }
+            r if r.starts_with("np-") => Category::Network,
+            r if r.starts_with("dns-") => Category::Dns,
+            r if r.starts_with("mesh-") => Category::Mesh,
+            "pod-imagepull" => Category::Image,
+            "pod-config" | "config-missing" | "admission-denied" => Category::Config,
+            r if r.starts_with("storage-") => Category::Storage,
+            "pod-unschedulable" => Category::Scheduling,
+            "quota-exceeded" => Category::Capacity,
+            r if r.starts_with("hpa-") => Category::Scaling,
+            "pod-oom" | "pod-crashloop" | "pod-notready" | "workload-unavailable" => Category::Runtime,
+            r if r.starts_with("node-") || r == "pod-evicted" => Category::Node,
+            _ => Category::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
@@ -181,6 +365,8 @@ pub struct Issue {
     pub id: String,
     pub severity: Severity,
     pub layer: Layer,
+    /// Filled in by `diagnose` from the rule id.
+    pub category: Category,
     pub target: Target,
     pub title: String,
     pub detail: String,

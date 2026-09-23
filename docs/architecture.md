@@ -34,19 +34,39 @@ kubeconfig ──► kube::Client ──► list (nodes, pods, services, endpoin
 
 ## Diagnosis rules
 
-Each rule belongs to one layer of the request path.
+Each issue has a **layer** (where on the request path it sits) and a
+**category** (what kind of problem it is). Categories are derived from the rule
+id in `Category::for_rule`, so every rule is classified in one place.
 
-| Layer | What it catches |
+| Category | What Tessera catches |
 |---|---|
-| Entry | Ingress backends that point at services that don't exist |
-| Service | Selectors that match no pods, with the likely correct labels; services with no ready endpoints; services whose only workload is scaled to zero |
-| Workload | Replicas not ready without a pod-level explanation (often a rollout) |
-| Pod | OOMKilled crash loops (with the limit and a suggested value), other crash loops (with exit-code hints), image pull failures (missing tag vs. auth), missing ConfigMaps or Secrets, failing readiness |
-| Node | Unschedulable pods (CPU or memory too large for any node, taints, affinity, unbound PVCs), NotReady nodes, pressure conditions, cordoned nodes |
+| Routing | Ingress backends pointing at missing services; ingress classes that don't exist or no default class; ingresses with no address; missing TLS secrets; cloud load balancers that failed to provision (with subnet and quota hints) or never got an address; selectors that match no pods (with the likely correct labels); no ready endpoints; named target ports no pod defines; target ports that don't match declared container ports |
+| Network policy | Policies that block inbound traffic to a service's port; policies that only admit specific sources on a routed service (ingress controller may be excluded); egress policies that block DNS on port 53 |
+| DNS | Cluster DNS (kube-dns/CoreDNS) with no ready endpoints; degraded CoreDNS replicas; node resolv.conf being truncated (DNSConfigForming) |
+| Service mesh | Pods missing the Istio sidecar in injected namespaces; VirtualService destinations that don't exist; subsets no DestinationRule defines; subsets whose labels match no pods |
+| Images | Pull failures, split into missing tag vs. registry auth |
+| Config and admission | Missing ConfigMaps or Secrets (env or volume); pods rejected by admission webhooks or Pod Security |
+| Storage | Unbound PVCs (missing storage class, CSI driver not provisioning); volumes that fail to mount or attach, including Multi-Attach during rollouts |
+| Scheduling | Pods too large for any node, taints, affinity, unbound claims |
+| Quota | Pods refused because a namespace ResourceQuota is exhausted |
+| Autoscaling | HPAs that can't read metrics (metrics-server, missing requests), HPAs pinned at max, HPAs unable to scale |
+| Crashes and probes | OOMKilled crash loops, other crash loops with exit-code hints, crash loops caused by failing liveness probes, readiness failures, rollouts that don't converge |
+| Nodes | NotReady, pressure conditions, cordoned nodes, evicted pods |
+
+Rules are deliberately conservative. For example, a NetworkPolicy that uses
+`matchExpressions` is skipped rather than guessed at, and the TLS rule only runs
+when Secret names can be listed.
 
 Pod findings are grouped per workload, and service symptoms are downgraded to
 warnings when a pod issue already explains them, so the list points at root
 causes rather than every symptom.
+
+### Not covered yet
+
+Some failures can't be seen from the Kubernetes API alone:
+cloud load balancer **target health** (needs cloud credentials), connection
+failures between specific pods, CNI or kube-proxy faults, and application-level
+errors. These are on the roadmap as optional probes.
 
 ## Adding a rule
 

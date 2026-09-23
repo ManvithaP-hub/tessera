@@ -5,10 +5,17 @@ use crate::model::*;
 use crate::quantity;
 use crate::Result;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
-use k8s_openapi::api::core::v1::{Container, ContainerStatus, Event, Node, Pod, PodSpec, Service};
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+use k8s_openapi::api::core::v1::{
+    Container, ContainerStatus, Event, Namespace, Node, PersistentVolumeClaim, Pod, PodSpec, Secret, Service,
+};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::api::networking::v1::{Ingress, IngressBackend};
-use kube::api::{Api, ListParams, LogParams};
+use k8s_openapi::api::networking::v1::{
+    Ingress, IngressBackend, IngressClass, NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams};
 use kube::{Client, Resource};
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, HashMap};
@@ -52,6 +59,16 @@ pub async fn collect(client: Client, context: &str) -> Result<ClusterGraph> {
         list_all::<ReplicaSet>(&client, "replicasets", lp()),
         list_all::<Event>(&client, "events", lp().fields("type=Warning")),
     );
+    let (namespaces, netpols, pvcs, hpas, classes, secrets, vss, drs) = tokio::join!(
+        list_all::<Namespace>(&client, "namespaces", lp()),
+        list_all::<NetworkPolicy>(&client, "network policies", lp()),
+        list_all::<PersistentVolumeClaim>(&client, "persistent volume claims", lp()),
+        list_all::<HorizontalPodAutoscaler>(&client, "horizontal pod autoscalers", lp()),
+        list_all::<IngressClass>(&client, "ingress classes", lp()),
+        secret_names(&client),
+        list_istio(&client, "VirtualService"),
+        list_istio(&client, "DestinationRule"),
+    );
 
     let mut warnings = Vec::new();
     fn take<T>(r: std::result::Result<Vec<T>, String>, warnings: &mut Vec<String>) -> Vec<T> {
@@ -71,6 +88,14 @@ pub async fn collect(client: Client, context: &str) -> Result<ClusterGraph> {
         daemonsets: take(dss, &mut warnings),
         replicasets: take(rss, &mut warnings),
         events: take(events, &mut warnings),
+        namespaces: take(namespaces, &mut warnings),
+        network_policies: take(netpols, &mut warnings),
+        pvcs: take(pvcs, &mut warnings),
+        hpas: take(hpas, &mut warnings),
+        ingress_classes: take(classes, &mut warnings),
+        secret_names: secrets,
+        virtual_services: vss,
+        destination_rules: drs,
     };
     let mut g = build_graph(&raw, context);
     g.server_version = Some(version.git_version);
@@ -91,6 +116,16 @@ pub struct RawSnapshot {
     pub daemonsets: Vec<DaemonSet>,
     pub replicasets: Vec<ReplicaSet>,
     pub events: Vec<Event>,
+    pub namespaces: Vec<Namespace>,
+    pub network_policies: Vec<NetworkPolicy>,
+    pub pvcs: Vec<PersistentVolumeClaim>,
+    pub hpas: Vec<HorizontalPodAutoscaler>,
+    pub ingress_classes: Vec<IngressClass>,
+    /// `namespace/name`; `None` when listing Secret metadata isn't allowed.
+    pub secret_names: Option<Vec<String>>,
+    /// Istio objects, or `None` when Istio isn't installed.
+    pub virtual_services: Option<Vec<DynamicObject>>,
+    pub destination_rules: Option<Vec<DynamicObject>>,
 }
 
 /// Convert raw objects into the graph and run diagnosis. Pure, so it can be
@@ -107,6 +142,7 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
         daemonsets: dss,
         replicasets: rss,
         events,
+        ..
     } = raw;
     let mut g = ClusterGraph { context: context.to_string(), fetched_at: now_unix(), ..Default::default() };
 
@@ -231,6 +267,21 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
             .filter(|w| w.namespace == ns && labels_match(&selector, &w.pod_labels))
             .map(|w| w.id.clone())
             .collect();
+        let ports_detail = spec
+            .ports
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| ServicePortInfo {
+                port: p.port,
+                target: match &p.target_port {
+                    Some(IntOrString::Int(i)) => i.to_string(),
+                    Some(IntOrString::String(s)) => s.clone(),
+                    None => p.port.to_string(),
+                },
+                protocol: p.protocol.clone().unwrap_or_else(|| "TCP".into()),
+            })
+            .collect();
         let ports = spec
             .ports
             .unwrap_or_default()
@@ -263,6 +314,7 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
             cluster_ip: spec.cluster_ip,
             selector,
             ports,
+            ports_detail,
             external,
             ready_endpoints: ready,
             not_ready_endpoints: not_ready,
@@ -299,7 +351,15 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
             .and_then(|lb| lb.ingress.as_ref())
             .map(|v| v.iter().filter_map(|i| i.hostname.clone().or_else(|| i.ip.clone())).collect())
             .unwrap_or_default();
-        g.ingresses.push(IngressInfo { namespace: ns, name, class_name: spec.ingress_class_name, addresses, routes });
+        let tls_secrets = spec.tls.unwrap_or_default().iter().filter_map(|t| t.secret_name.clone()).collect();
+        g.ingresses.push(IngressInfo {
+            namespace: ns,
+            name,
+            class_name: spec.ingress_class_name,
+            addresses,
+            routes,
+            tls_secrets,
+        });
     }
 
     g.events = events
@@ -322,8 +382,238 @@ pub fn build_graph(raw: &RawSnapshot, context: &str) -> ClusterGraph {
         .collect();
     g.events.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
 
+    g.namespaces = raw
+        .namespaces
+        .iter()
+        .map(|n| NamespaceInfo {
+            name: n.metadata.name.clone().unwrap_or_default(),
+            labels: n.metadata.labels.clone().unwrap_or_default(),
+        })
+        .collect();
+    g.network_policies = raw.network_policies.iter().map(convert_netpol).collect();
+    g.pvcs = raw
+        .pvcs
+        .iter()
+        .map(|p| {
+            let (namespace, name) = ns_name(p);
+            PvcInfo {
+                namespace,
+                name,
+                phase: p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Pending".into()),
+                storage_class: p.spec.as_ref().and_then(|s| s.storage_class_name.clone()),
+            }
+        })
+        .collect();
+    g.hpas = raw
+        .hpas
+        .iter()
+        .map(|h| {
+            let (namespace, name) = ns_name(h);
+            let spec = h.spec.clone().unwrap_or_default();
+            let st = h.status.clone().unwrap_or_default();
+            HpaInfo {
+                namespace,
+                name,
+                target: format!("{}/{}", spec.scale_target_ref.kind, spec.scale_target_ref.name),
+                min: spec.min_replicas.unwrap_or(1),
+                max: spec.max_replicas,
+                current: st.current_replicas.unwrap_or(0),
+                desired: st.desired_replicas,
+                conditions: st
+                    .conditions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| ConditionInfo { type_: c.type_, status: c.status, reason: c.reason, message: c.message })
+                    .collect(),
+            }
+        })
+        .collect();
+    g.ingress_classes = raw.ingress_classes.iter().filter_map(|c| c.metadata.name.clone()).collect();
+    g.default_ingress_class = raw
+        .ingress_classes
+        .iter()
+        .find(|c| {
+            c.metadata.annotations.as_ref().and_then(|a| a.get("ingressclass.kubernetes.io/is-default-class"))
+                == Some(&"true".to_string())
+        })
+        .and_then(|c| c.metadata.name.clone());
+    g.secret_names = raw.secret_names.clone();
+    g.mesh = convert_mesh(raw.virtual_services.as_deref(), raw.destination_rules.as_deref());
+
     g.issues = diagnose(&g);
     g
+}
+
+fn fmt_label_selector(sel: &LabelSelector) -> String {
+    let mut parts: Vec<String> =
+        sel.match_labels.clone().unwrap_or_default().iter().map(|(k, v)| format!("{k}={v}")).collect();
+    for e in sel.match_expressions.clone().unwrap_or_default() {
+        let vals = e.values.unwrap_or_default().join(",");
+        parts.push(if vals.is_empty() {
+            format!("{} {}", e.key, e.operator)
+        } else {
+            format!("{} {} ({vals})", e.key, e.operator)
+        });
+    }
+    parts.join(",")
+}
+
+fn peer_text(p: &NetworkPolicyPeer) -> String {
+    if let Some(ip) = &p.ip_block {
+        return format!("ipBlock {}", ip.cidr);
+    }
+    match (&p.namespace_selector, &p.pod_selector) {
+        (Some(ns), pods) => {
+            let nss = fmt_label_selector(ns);
+            let base = if nss.is_empty() { "all namespaces".to_string() } else { format!("namespaces {nss}") };
+            match pods.as_ref().map(fmt_label_selector) {
+                Some(ps) if !ps.is_empty() => format!("{base}, pods {ps}"),
+                _ => base,
+            }
+        }
+        (None, Some(ps)) => {
+            let s = fmt_label_selector(ps);
+            if s.is_empty() {
+                "all pods in this namespace".into()
+            } else {
+                format!("pods {s} in this namespace")
+            }
+        }
+        (None, None) => "all peers".into(),
+    }
+}
+
+fn np_ports(ports: Option<&Vec<NetworkPolicyPort>>) -> Vec<NpPort> {
+    ports
+        .map(|v| {
+            v.iter()
+                .map(|p| NpPort {
+                    port: p.port.as_ref().map(|x| match x {
+                        IntOrString::Int(i) => i.to_string(),
+                        IntOrString::String(s) => s.clone(),
+                    }),
+                    end_port: p.end_port,
+                    protocol: p.protocol.clone().unwrap_or_else(|| "TCP".into()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn convert_netpol(np: &NetworkPolicy) -> NetworkPolicyInfo {
+    let (namespace, name) = ns_name(np);
+    let spec = np.spec.clone().unwrap_or_default();
+    let sel = spec.pod_selector.clone().unwrap_or_default();
+    let types = spec.policy_types.clone().unwrap_or_default();
+    let has_egress_rules = spec.egress.is_some();
+    NetworkPolicyInfo {
+        namespace,
+        name,
+        pod_selector: sel.match_labels.clone().unwrap_or_default(),
+        selector_complex: sel.match_expressions.as_ref().is_some_and(|e| !e.is_empty()),
+        // Per the API: with no policyTypes, Ingress always applies and Egress
+        // applies when egress rules are present.
+        ingress_type: if types.is_empty() { true } else { types.iter().any(|t| t == "Ingress") },
+        egress_type: if types.is_empty() { has_egress_rules } else { types.iter().any(|t| t == "Egress") },
+        ingress: spec
+            .ingress
+            .unwrap_or_default()
+            .iter()
+            .map(|r| NpRule {
+                peers: r.from.clone().unwrap_or_default().iter().map(peer_text).collect(),
+                ports: np_ports(r.ports.as_ref()),
+            })
+            .collect(),
+        egress: spec
+            .egress
+            .unwrap_or_default()
+            .iter()
+            .map(|r| NpRule {
+                peers: r.to.clone().unwrap_or_default().iter().map(peer_text).collect(),
+                ports: np_ports(r.ports.as_ref()),
+            })
+            .collect(),
+    }
+}
+
+fn convert_mesh(vss: Option<&[DynamicObject]>, drs: Option<&[DynamicObject]>) -> MeshInfo {
+    let mut m = MeshInfo { installed: vss.is_some() || drs.is_some(), ..Default::default() };
+    for vs in vss.unwrap_or_default() {
+        let spec = &vs.data["spec"];
+        let mut dests = Vec::new();
+        for kind in ["http", "tcp", "tls"] {
+            for route in spec[kind].as_array().into_iter().flatten() {
+                for r in route["route"].as_array().into_iter().flatten() {
+                    if let Some(host) = r["destination"]["host"].as_str() {
+                        dests.push((host.to_string(), r["destination"]["subset"].as_str().map(String::from)));
+                    }
+                }
+            }
+        }
+        m.virtual_services.push(VirtualServiceInfo {
+            namespace: vs.metadata.namespace.clone().unwrap_or_default(),
+            name: vs.metadata.name.clone().unwrap_or_default(),
+            hosts: spec["hosts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|h| h.as_str().map(String::from))
+                .collect(),
+            destinations: dests,
+        });
+    }
+    for dr in drs.unwrap_or_default() {
+        let spec = &dr.data["spec"];
+        m.destination_rules.push(DestinationRuleInfo {
+            namespace: dr.metadata.namespace.clone().unwrap_or_default(),
+            name: dr.metadata.name.clone().unwrap_or_default(),
+            host: spec["host"].as_str().unwrap_or_default().to_string(),
+            subsets: spec["subsets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|s| {
+                    let labels = s["labels"]
+                        .as_object()
+                        .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+                        .unwrap_or_default();
+                    (s["name"].as_str().unwrap_or_default().to_string(), labels)
+                })
+                .collect(),
+        });
+    }
+    m
+}
+
+/// Secret names only (metadata), never contents. Many clusters deny this, so
+/// failure is silent and simply disables the TLS-secret rule.
+async fn secret_names(client: &Client) -> Option<Vec<String>> {
+    let api: Api<Secret> = Api::all(client.clone());
+    let list = api.list_metadata(&ListParams::default()).await.ok()?;
+    Some(
+        list.items
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/{}",
+                    s.metadata.namespace.clone().unwrap_or_default(),
+                    s.metadata.name.clone().unwrap_or_default()
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Istio objects via the dynamic API. Returns `None` when Istio isn't installed.
+async fn list_istio(client: &Client, kind: &str) -> Option<Vec<DynamicObject>> {
+    for version in ["v1", "v1beta1"] {
+        let ar = ApiResource::from_gvk(&GroupVersionKind::gvk("networking.istio.io", version, kind));
+        let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+        if let Ok(list) = api.list(&ListParams::default()).await {
+            return Some(list.items);
+        }
+    }
+    None
 }
 
 fn backend(b: &IngressBackend) -> Option<(String, Option<String>)> {
@@ -444,6 +734,26 @@ fn convert_pod(p: &Pod, namespace: String, name: String, workload: Option<String
         pod_ip: status.pod_ip.clone(),
         created: p.metadata.creation_timestamp.as_ref().map(|t| t.0.to_string()),
         containers,
+        init_containers: spec.init_containers.clone().unwrap_or_default().iter().map(|c| c.name.clone()).collect(),
+        container_ports: spec
+            .containers
+            .iter()
+            .chain(spec.init_containers.as_deref().unwrap_or_default())
+            .flat_map(|c| c.ports.clone().unwrap_or_default())
+            .map(|p| ContainerPortInfo {
+                name: p.name,
+                port: p.container_port,
+                protocol: p.protocol.unwrap_or_else(|| "TCP".into()),
+            })
+            .collect(),
+        pvcs: spec
+            .volumes
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.persistent_volume_claim.as_ref().map(|c| c.claim_name.clone()))
+            .collect(),
+        message: status.message.clone(),
         namespace,
         name,
     }

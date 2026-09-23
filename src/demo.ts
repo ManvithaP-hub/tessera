@@ -73,7 +73,7 @@ export function demoGraph(context: string): ClusterGraph {
   const services = [svc(store, P.store), svc(checkout, P.checkout), svc(pay, P.pay), svc(cat, P.cat, "catalog-svc"), svc(rec, P.rec), svc(redis, P.redis)];
   const issues: Issue[] = [
     {
-      id: "entry-missing-backend:web/shop-edge/cart", severity: "critical", layer: "entry",
+      id: "entry-missing-backend:web/shop-edge/cart", severity: "critical", layer: "entry", category: "routing",
       target: { kind: "Ingress", namespace: "web", name: "shop-edge" },
       title: "Ingress routes to a service that doesn't exist: cart",
       detail: "shop-edge sends shop.example.com/cart to service cart, but there is no service with that name in web. Requests on these routes fail at the ingress controller.",
@@ -82,7 +82,7 @@ export function demoGraph(context: string): ClusterGraph {
       commands: ["kubectl get ingress shop-edge -n web -o yaml", "kubectl get svc -n web"], pods: [],
     },
     {
-      id: "svc-no-match:web/catalog", severity: "critical", layer: "service",
+      id: "svc-no-match:web/catalog", severity: "critical", layer: "service", category: "routing",
       target: { kind: "Service", namespace: "web", name: "catalog" },
       title: "Service catalog selects no pods",
       detail: "No pod in web has the labels app=catalog-svc, so the service has no endpoints and anything routed to it gets connection errors or 503s.",
@@ -91,7 +91,7 @@ export function demoGraph(context: string): ClusterGraph {
       commands: ["kubectl describe svc catalog -n web", "kubectl get pods -n web -l app=catalog-svc"], pods: [],
     },
     {
-      id: "pod-oom:Deployment/payments/payments-api", severity: "critical", layer: "pod",
+      id: "pod-oom:Deployment/payments/payments-api", severity: "critical", layer: "pod", category: "runtime",
       target: { kind: "Deployment", namespace: "payments", name: "payments-api" },
       title: "Deployment payments-api is running out of memory",
       detail: "Container payments-api in 2 pods was killed for using more than its 256Mi memory limit, then restarted.",
@@ -101,7 +101,7 @@ export function demoGraph(context: string): ClusterGraph {
       pods: P.pay.slice(0, 2).map((p) => p.name),
     },
     {
-      id: "pod-imagepull:Deployment/web/checkout", severity: "critical", layer: "pod",
+      id: "pod-imagepull:Deployment/web/checkout", severity: "critical", layer: "pod", category: "image",
       target: { kind: "Deployment", namespace: "web", name: "checkout" },
       title: "Deployment checkout can't pull its image",
       detail: "1 pod can't start because the image for container checkout can't be pulled.",
@@ -110,7 +110,7 @@ export function demoGraph(context: string): ClusterGraph {
       commands: [`kubectl describe pod ${P.checkout[0].name} -n web`], pods: [P.checkout[0].name],
     },
     {
-      id: "pod-unschedulable:Deployment/ml/recommender", severity: "critical", layer: "node",
+      id: "pod-unschedulable:Deployment/ml/recommender", severity: "critical", layer: "node", category: "scheduling",
       target: { kind: "Deployment", namespace: "ml", name: "recommender" },
       title: "Deployment recommender can't be scheduled",
       detail: "2 pods stuck in Pending because no node can take them.",
@@ -119,13 +119,32 @@ export function demoGraph(context: string): ClusterGraph {
       commands: [`kubectl describe pod ${P.rec[0].name} -n ml`], pods: P.rec.map((p) => p.name),
     },
     {
-      id: "svc-no-ready:ml/recommender", severity: "warning", layer: "service",
+      id: "svc-no-ready:ml/recommender", severity: "warning", layer: "service", category: "routing",
       target: { kind: "Service", namespace: "ml", name: "recommender" },
       title: "Service recommender has no ready endpoints",
       detail: "The selector matches 2 pods, but none are ready. See the pod issues below for the cause.",
       evidence: ["selector: app=recommender", "ready endpoints: 0, not ready: 2"],
       suggestion: "Check the readiness probe and the pods' recent events.",
       commands: ["kubectl describe svc recommender -n ml"], pods: P.rec.map((p) => p.name),
+    },
+    {
+      id: "np-egress-dns:Deployment/payments/payments-api", severity: "warning", layer: "pod", category: "network",
+      target: { kind: "Deployment", namespace: "payments", name: "payments-api" },
+      title: "NetworkPolicy blocks DNS lookups from Deployment payments-api",
+      detail: "Egress policies select these pods but none allow port 53. Every hostname lookup fails, including other services in the cluster, so calls fail with name-resolution errors even though the targets are healthy.",
+      evidence: ["payments-egress: allows pods app=postgres in this namespace on 5432/TCP"],
+      suggestion: "Add an egress rule allowing UDP and TCP port 53 to the kube-system namespace (where CoreDNS runs).",
+      commands: ["kubectl get networkpolicy -n payments -o yaml", `kubectl exec -n payments ${P.pay[2].name} -- nslookup kubernetes.default`],
+      pods: P.pay.map((p) => p.name),
+    },
+    {
+      id: "ingress-tls-missing:web/shop-edge/shop-tls", severity: "critical", layer: "entry", category: "routing",
+      target: { kind: "Ingress", namespace: "web", name: "shop-edge" },
+      title: "TLS secret shop-tls for ingress shop-edge doesn't exist",
+      detail: "HTTPS on these hosts will fail or fall back to the controller's default certificate, which browsers reject.",
+      evidence: ["spec.tls secretName: shop-tls", "namespace: web"],
+      suggestion: "Create the secret (or check your cert-manager Certificate is Ready), in the same namespace as the ingress.",
+      commands: ["kubectl get secret shop-tls -n web", "kubectl get certificate -n web"], pods: [],
     },
   ];
   return {
@@ -149,6 +168,8 @@ export function demoGraph(context: string): ClusterGraph {
       { namespace: "ml", kind: "Pod", name: P.rec[0].name, type: "Warning", reason: "FailedScheduling", message: "0/3 nodes are available: 3 Insufficient cpu.", count: 41, lastSeen: null },
       { namespace: "web", kind: "Pod", name: P.checkout[0].name, type: "Warning", reason: "Failed", message: "Failed to pull image \"ghcr.io/acme/checkout:2.5.0-rc1\": not found", count: 18, lastSeen: null },
     ],
+    namespaces: [], networkPolicies: [], pvcs: [], hpas: [], ingressClasses: ["alb"], defaultIngressClass: "alb",
+    secretNames: null, mesh: { installed: false, virtualServices: [], destinationRules: [] },
     issues,
     warnings: [],
   };

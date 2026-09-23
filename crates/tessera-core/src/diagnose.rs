@@ -16,6 +16,10 @@ pub fn diagnose(g: &ClusterGraph) -> Vec<Issue> {
     service_rules(g, &pod_issue_pods, &mut out);
     node_rules(g, &mut out);
     workload_rules(g, &pod_issue_pods, &mut out);
+    crate::extended::run(g, &mut out);
+    for i in &mut out {
+        i.category = Category::for_rule(&i.id);
+    }
     out.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
@@ -56,6 +60,7 @@ fn entry_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
                 id: format!("entry-missing-backend:{}/{}/{}", ing.namespace, ing.name, svc),
                 severity: Severity::Critical,
                 layer: Layer::Entry,
+                category: Category::Other,
                 target: target("Ingress", &ing.namespace, &ing.name),
                 title: format!("Ingress routes to a service that doesn't exist: {svc}"),
                 detail: format!(
@@ -105,6 +110,7 @@ fn service_rules(g: &ClusterGraph, pod_issue_pods: &BTreeSet<String>, out: &mut 
                     id: format!("svc-scaled-zero:{}/{}", s.namespace, s.name),
                     severity: Severity::Warning,
                     layer: Layer::Service,
+                    category: Category::Other,
                     target: target("Service", &s.namespace, &s.name),
                     title: format!("Service {} has no pods: {} is scaled to 0", s.name, w.name),
                     detail: format!(
@@ -175,6 +181,7 @@ fn service_rules(g: &ClusterGraph, pod_issue_pods: &BTreeSet<String>, out: &mut 
                 id: format!("svc-no-match:{}/{}", s.namespace, s.name),
                 severity: Severity::Critical,
                 layer: Layer::Service,
+                category: Category::Other,
                 target: target("Service", &s.namespace, &s.name),
                 title: format!("Service {} selects no pods", s.name),
                 detail: format!(
@@ -194,6 +201,7 @@ fn service_rules(g: &ClusterGraph, pod_issue_pods: &BTreeSet<String>, out: &mut 
                 id: format!("svc-no-ready:{}/{}", s.namespace, s.name),
                 severity: if explained { Severity::Warning } else { Severity::Critical },
                 layer: Layer::Service,
+                category: Category::Other,
                 target: target("Service", &s.namespace, &s.name),
                 title: format!("Service {} has no ready endpoints", s.name),
                 detail: if explained {
@@ -253,6 +261,7 @@ fn pod_rules(g: &ClusterGraph, out: &mut Vec<Issue>) -> BTreeSet<String> {
             id: String::new(),
             severity: Severity::Critical,
             layer: Layer::Pod,
+            category: Category::Other,
             target: target(tkind, tns, tname),
             title: String::new(),
             detail: String::new(),
@@ -330,6 +339,23 @@ fn pod_rules(g: &ClusterGraph, out: &mut Vec<Issue>) -> BTreeSet<String> {
                 };
                 let mut commands = base.commands.clone();
                 commands.push(format!("kubectl logs {} -n {ns} -c {} --previous", first.name, c.name));
+                let liveness = g.events.iter().find(|e| {
+                    e.kind == "Pod"
+                        && e.namespace == first.namespace
+                        && pods.iter().any(|p| p.name == e.name)
+                        && e.message.contains("Liveness probe failed")
+                });
+                let (hint, suggestion) = match liveness {
+                    Some(_) => (
+                        "Its liveness probe is failing, so the kubelet keeps killing it. The app may be healthy but slow to start, or the probe may point at the wrong path or port.",
+                        "Compare the liveness probe's path, port and timing with what the app serves. For slow starters, add a startupProbe or raise initialDelaySeconds.",
+                    ),
+                    None => (hint, "Read the previous container's logs to see why it exited."),
+                };
+                let mut evidence_extra = Vec::new();
+                if let Some(e) = liveness {
+                    evidence_extra.push(format!("Unhealthy: {}", e.message));
+                }
                 Issue {
                     id: format!("pod-crashloop:{key}"),
                     title: format!("{who} is crash looping"),
@@ -342,8 +368,11 @@ fn pod_rules(g: &ClusterGraph, out: &mut Vec<Issue>) -> BTreeSet<String> {
                             code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())
                         ),
                         format!("restart count: {}", c.restart_count),
-                    ],
-                    suggestion: "Read the previous container's logs to see why it exited.".into(),
+                    ]
+                    .into_iter()
+                    .chain(evidence_extra)
+                    .collect(),
+                    suggestion: suggestion.into(),
                     commands,
                     ..base
                 }
@@ -446,6 +475,7 @@ fn pod_rules(g: &ClusterGraph, out: &mut Vec<Issue>) -> BTreeSet<String> {
                 Issue {
                     id: format!("pod-unschedulable:{key}"),
                     layer: Layer::Node,
+                    category: Category::Other,
                     title: format!("{who} can't be scheduled"),
                     detail: format!("{count} stuck in Pending because no node can take them."),
                     evidence,
@@ -536,6 +566,7 @@ fn node_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
                 id: format!("node-notready:{}", n.name),
                 severity: Severity::Critical,
                 layer: Layer::Node,
+                category: Category::Other,
                 target: target("Node", "", &n.name),
                 title: format!("Node {} is not ready", n.name),
                 detail: format!("The kubelet on {} isn't reporting Ready. {on} pods are assigned to it.", n.name),
@@ -551,6 +582,7 @@ fn node_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
                 id: format!("node-pressure:{}", n.name),
                 severity: Severity::Warning,
                 layer: Layer::Node,
+                category: Category::Other,
                 target: target("Node", "", &n.name),
                 title: format!("Node {} reports {}", n.name, n.pressure.join(", ")),
                 detail: "The kubelet may evict pods from this node until the pressure clears.".into(),
@@ -565,6 +597,7 @@ fn node_rules(g: &ClusterGraph, out: &mut Vec<Issue>) {
                 id: format!("node-cordoned:{}", n.name),
                 severity: Severity::Warning,
                 layer: Layer::Node,
+                category: Category::Other,
                 target: target("Node", "", &n.name),
                 title: format!("Node {} is cordoned", n.name),
                 detail: "No new pods will be scheduled here until it is uncordoned.".into(),
@@ -594,6 +627,7 @@ fn workload_rules(g: &ClusterGraph, pod_issue_pods: &BTreeSet<String>, out: &mut
             id: format!("workload-unavailable:{}", w.id),
             severity: Severity::Warning,
             layer: Layer::Workload,
+            category: Category::Other,
             target: target(&w.kind, &w.namespace, &w.name),
             title: format!("{} {} has {} of {} replicas ready", w.kind, w.name, w.ready, w.desired),
             detail: "None of its pods show a specific failure, so this is often a rollout in progress or pods still starting.".into(),
@@ -771,8 +805,10 @@ mod tests {
             ..Default::default()
         };
         let issues = diagnose(&g);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].layer, Layer::Entry);
+        let missing: Vec<_> = issues.iter().filter(|i| i.id.starts_with("entry-missing-backend")).collect();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].layer, Layer::Entry);
+        assert_eq!(missing[0].category, Category::Routing);
     }
 
     #[test]

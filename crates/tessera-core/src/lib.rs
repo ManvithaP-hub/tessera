@@ -6,6 +6,7 @@
 
 pub mod collect;
 pub mod diagnose;
+pub mod extended;
 pub mod kubeconfig;
 pub mod model;
 pub mod quantity;

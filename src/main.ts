@@ -7,7 +7,7 @@ import "./styles.css";
 
 import * as api from "./api";
 import { buildRows, health, podClass, renderMap, tkey, type Row } from "./map";
-import type { ClusterGraph, Issue, PodInfo } from "./types";
+import type { Category, ClusterGraph, Issue, PodInfo } from "./types";
 import { ago, clip, esc, fmtBytes, fmtCpu, SYSTEM_NS, toast } from "./util";
 
 type View = "map" | "issues" | "workloads" | "events";
@@ -37,6 +37,7 @@ const S = {
   showSystem: false,
   auto: store.get("tessera.auto") !== "off",
   selIssue: "",
+  selCategory: "" as Category | "",
   podQuery: "",
 };
 if (!VIEWS.some((v) => v[0] === S.view)) S.view = "map";
@@ -187,9 +188,25 @@ function trace(i: Issue): TraceLayer[] {
   return L;
 }
 
+const CATEGORY_LABEL: Record<Category, string> = {
+  routing: "Routing", network: "Network policy", dns: "DNS", mesh: "Service mesh", image: "Images",
+  config: "Config and admission", storage: "Storage", scheduling: "Scheduling", capacity: "Quota",
+  scaling: "Autoscaling", runtime: "Crashes and probes", node: "Nodes", other: "Other",
+};
+
 function viewIssues() {
   if (!rowsCache.length) rowsCache = buildRows(S.g!, inScope);
-  const issues = scopedIssues();
+  const inScopeIssues = scopedIssues();
+  const counts = new Map<Category, number>();
+  inScopeIssues.forEach((i) => counts.set(i.category, (counts.get(i.category) ?? 0) + 1));
+  if (S.selCategory && !counts.has(S.selCategory)) S.selCategory = "";
+  const issues = S.selCategory ? inScopeIssues.filter((i) => i.category === S.selCategory) : inScopeIssues;
+  const catBar = counts.size > 1
+    ? `<div class="chips" role="group" aria-label="Filter by category"><button class="chip" data-cat="" aria-pressed="${!S.selCategory}">All ${inScopeIssues.length}</button>${[...counts]
+        .sort((a, b) => b[1] - a[1])
+        .map(([c, n]) => `<button class="chip" data-cat="${c}" aria-pressed="${S.selCategory === c}">${CATEGORY_LABEL[c] ?? c} ${n}</button>`)
+        .join("")}</div>`
+    : "";
   if (!issues.length) {
     $("#view").innerHTML = `<div class="panel empty"><h2>No issues found</h2><p>Every route, service, workload and node in ${S.ns ? esc(S.ns) : "these namespaces"} looks healthy in this snapshot.</p></div>`;
     return;
@@ -205,14 +222,16 @@ function viewIssues() {
     ? `<button class="linkbtn" data-kind="node" data-id="${esc(sel.target.name)}">${esc(sel.target.name)}</button>`
     : sel.target.kind === "Service"
       ? `<button class="linkbtn" data-kind="service" data-id="${esc(tkey("Service", sel.target.namespace, sel.target.name))}">${esc(sel.target.namespace)}/${esc(sel.target.name)}</button>`
+      : !["Deployment", "StatefulSet", "DaemonSet", "Ingress"].includes(sel.target.kind)
+        ? `<span>${esc(sel.target.namespace)}/${esc(sel.target.name)}</span>`
       : sel.target.kind === "Ingress"
         ? `<button class="linkbtn" data-kind="ingress" data-id="${esc(`${sel.target.namespace}/${sel.target.name}`)}">${esc(sel.target.namespace)}/${esc(sel.target.name)}</button>`
         : `<button class="linkbtn" data-kind="workload" data-id="${esc(tkey(sel.target.kind, sel.target.namespace, sel.target.name))}">${esc(sel.target.namespace)}/${esc(sel.target.name)}</button>`;
-  $("#view").innerHTML = `<div class="issues">
-    <div class="ilist">${issues.map((i) => `<button data-issue="${esc(i.id)}" aria-pressed="${i.id === sel.id}"><div class="nm"><span class="st ${i.severity === "critical" ? "bad" : "warn"}"></span> ${esc(i.title)}</div><div class="ds">${esc(i.target.kind)} ${esc(i.target.namespace ? `${i.target.namespace}/` : "")}${esc(i.target.name)}</div></button>`).join("")}</div>
+  $("#view").innerHTML = `${catBar}<div class="issues">
+    <div class="ilist">${issues.map((i) => `<button data-issue="${esc(i.id)}" aria-pressed="${i.id === sel.id}"><div class="nm"><span class="st ${i.severity === "critical" ? "bad" : "warn"}"></span> ${esc(i.title)}</div><div class="ds">${CATEGORY_LABEL[i.category] ?? ""}: ${esc(i.target.kind)} ${esc(i.target.namespace ? `${i.target.namespace}/` : "")}${esc(i.target.name)}</div></button>`).join("")}</div>
     <div class="panel pad">
       <h2>${esc(sel.title)}</h2>
-      <p class="muted" style="margin:4px 0 14px">${sel.severity === "critical" ? "Critical" : "Warning"} on ${esc(sel.target.kind)} ${targetBtn}</p>
+      <p class="muted" style="margin:4px 0 14px">${sel.severity === "critical" ? "Critical" : "Warning"}, ${esc((CATEGORY_LABEL[sel.category] ?? "").toLowerCase())}, on ${esc(sel.target.kind)} ${targetBtn}</p>
       <p style="margin:0 0 14px">${esc(sel.detail)}</p>
       <h3>Request path</h3><div class="layers">${layers}</div>
       ${sel.evidence.length ? `<h3>Evidence</h3><pre class="ev" style="margin-bottom:18px">${esc(sel.evidence.join("\n"))}</pre>` : ""}
@@ -430,9 +449,10 @@ function toggleTheme() {
 /* ---------------- Events ---------------- */
 
 document.addEventListener("click", (e) => {
-  const t = (e.target as HTMLElement).closest<HTMLElement>("[data-view],[data-kind],[data-issue],[data-copy],[data-close],#refresh,#theme,#logload");
+  const t = (e.target as HTMLElement).closest<HTMLElement>("[data-view],[data-kind],[data-issue],[data-cat],[data-copy],[data-close],#refresh,#theme,#logload");
   if (!t) return;
-  if (t.dataset.view) go(t.dataset.view as View);
+  if (t.dataset.cat !== undefined) { S.selCategory = t.dataset.cat as Category | ""; render(); }
+  else if (t.dataset.view) go(t.dataset.view as View);
   else if (t.dataset.kind) openDrawer(t.dataset.kind, t.dataset.id ?? "");
   else if (t.dataset.issue) { closeOverlay(); S.selIssue = t.dataset.issue; go("issues"); }
   else if (t.dataset.copy) navigator.clipboard?.writeText(t.dataset.copy).then(() => toast("Copied"), () => toast("Copy isn't available here"));
