@@ -150,7 +150,7 @@ fn service_rules(g: &ClusterGraph, pod_issue_pods: &BTreeSet<String>, out: &mut 
                 sc
             };
             let mut ranked: Vec<(&WorkloadInfo, i32)> = candidates.iter().map(|w| (*w, score(w))).collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
             let best = match ranked.as_slice() {
                 [(w, sc), rest @ ..] if *sc >= 2 && rest.first().is_none_or(|r| r.1 < *sc) => Some(*w),
                 _ => None,
