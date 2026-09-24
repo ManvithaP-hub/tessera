@@ -1,8 +1,48 @@
 // Mirrors the serde output of crates/tessera-core/src/model.rs.
 
+export type Environment = "production" | "staging" | "development" | "other";
+
 export interface Contexts {
   current: string | null;
-  contexts: { name: string; cluster: string; user: string | null; namespace: string | null }[];
+  contexts: { name: string; environment: Environment; cluster: string; user: string | null; namespace: string | null }[];
+}
+
+export interface Policy {
+  allowNetworkTests: boolean;
+  allowNetworkTestsInProduction: boolean;
+  allowCloudChecks: boolean;
+  productionContextPatterns: string[];
+  stagingContextPatterns: string[];
+  developmentContextPatterns: string[];
+  allowedContexts: string[];
+  hiddenContexts: string[];
+  auditLog: boolean;
+  sources: string[];
+  locked: string[];
+  errors: string[];
+}
+
+export interface AuditEntry {
+  time: number;
+  user: string;
+  context: string;
+  environment: string;
+  action: string;
+  namespace: string | null;
+  target: string | null;
+  podsCreated: string[];
+  podsDeleted: string[];
+  outcome: string;
+}
+
+/** Settings that differ per cluster (context). */
+export interface ContextSettings {
+  awsProfile: string;
+  awsRegion: string;
+  probeImage: string;
+  clusterDomain: string;
+  /** "" means use the environment detected from the name. */
+  environment: "" | Environment;
 }
 
 export interface ClusterGraph {
@@ -176,4 +216,8 @@ export interface NetworkTestReport {
   plan: TestPlan;
   runs: { node: string | null; placement: string; results: CheckResult[]; error: string | null }[];
   findings: { status: "critical" | "warning" | "ok"; title: string; detail: string; suggestion: string }[];
+  podsCreated: string[];
+  podsDeleted: string[];
 }
+
+export interface PlanResponse { id: string; plan: TestPlan; environment: Environment; requiresConfirmation: boolean }

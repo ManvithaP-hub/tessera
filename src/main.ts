@@ -7,7 +7,7 @@ import "./styles.css";
 
 import * as api from "./api";
 import { buildRows, health, podClass, renderMap, tkey, type Row } from "./map";
-import type { Category, ClusterGraph, Issue, NetworkTestReport, PodInfo, Settings, TestPlan } from "./types";
+import type { Category, ClusterGraph, ContextSettings, Environment, Issue, NetworkTestReport, PlanResponse, PodInfo, Policy, Settings } from "./types";
 import { ago, clip, esc, fmtBytes, fmtCpu, SYSTEM_NS, toast } from "./util";
 
 type View = "map" | "issues" | "workloads" | "events" | "settings";
@@ -26,13 +26,20 @@ const store = {
   set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
 };
 
-const DEFAULT_SETTINGS: Settings = { cloudChecks: false, awsProfile: "", awsRegion: "", probeImage: "", clusterDomain: "" };
-function loadSettings(): Settings {
-  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(store.get("tessera.settings") ?? "{}") }; } catch { return { ...DEFAULT_SETTINGS }; }
+const DEFAULT_CTX: ContextSettings = { awsProfile: "", awsRegion: "", probeImage: "", clusterDomain: "", environment: "" };
+function loadGlobal(): { cloudChecks: boolean } {
+  try { return { cloudChecks: !!JSON.parse(store.get("tessera.settings") ?? "{}").cloudChecks }; } catch { return { cloudChecks: false }; }
 }
+function loadPerContext(): Record<string, ContextSettings> {
+  try { return JSON.parse(store.get("tessera.contextSettings") ?? "{}"); } catch { return {}; }
+}
+const RANK: Record<Environment, number> = { development: 0, other: 1, staging: 2, production: 3 };
 
 const S = {
-  settings: loadSettings(),
+  global: loadGlobal(),
+  perCtx: loadPerContext(),
+  policy: null as Policy | null,
+  envOf: {} as Record<string, Environment>,
   contexts: [] as string[],
   ctx: "",
   g: null as ClusterGraph | null,
@@ -48,6 +55,27 @@ const S = {
   podQuery: "",
 };
 if (!VIEWS.some((v) => v[0] === S.view)) S.view = "map";
+
+const ctxSettings = (ctx = S.ctx): ContextSettings => ({ ...DEFAULT_CTX, ...(S.perCtx[ctx] ?? {}) });
+/** Settings for the current context, as the backend expects them. */
+const settings = (): Settings => {
+  const c = ctxSettings();
+  return { cloudChecks: S.global.cloudChecks && (S.policy?.allowCloudChecks ?? true), awsProfile: c.awsProfile, awsRegion: c.awsRegion, probeImage: c.probeImage, clusterDomain: c.clusterDomain };
+};
+/** Detected environment, raised (never lowered) by a user override. */
+const envFor = (ctx = S.ctx): Environment => {
+  const auto = S.envOf[ctx] ?? "other";
+  const o = ctxSettings(ctx).environment;
+  return o && RANK[o] > RANK[auto] ? o : auto;
+};
+const ENV_LABEL: Record<Environment, string> = { production: "Production", staging: "Staging", development: "Development", other: "Unclassified" };
+/** Why a network test can't run on the current context, if it can't. */
+function testBlocked(): string | null {
+  const p = S.policy;
+  if (p && !p.allowNetworkTests) return "Network tests are turned off by policy.";
+  if (envFor() === "production" && !(p?.allowNetworkTestsInProduction ?? false)) return "Network tests are turned off for production contexts.";
+  return null;
+}
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 const inScope = (ns: string) => (S.ns ? ns === S.ns : S.showSystem || !SYSTEM_NS(ns));
@@ -76,6 +104,7 @@ function shell() {
         <div><h1 id="title"></h1><p class="sub" id="sub"></p></div>
         <div class="row"><button class="btn" id="refresh">Refresh</button><button class="btn" id="theme">Switch theme</button></div>
       </header>
+      <div id="envbar"></div>
       <div id="notices"></div>
       <section id="view"></section>
     </main>
@@ -84,7 +113,11 @@ function shell() {
 }
 
 function renderSide() {
-  $("#ctx").innerHTML = S.contexts.map((c) => `<option ${c === S.ctx ? "selected" : ""}>${esc(c)}</option>`).join("");
+  $("#ctx").innerHTML = S.contexts.map((c) => `<option value="${esc(c)}" ${c === S.ctx ? "selected" : ""}>${esc(c)}${envFor(c) !== "other" ? ` (${ENV_LABEL[envFor(c)].toLowerCase()})` : ""}</option>`).join("");
+  const env = envFor();
+  $(".app").dataset.env = S.ctx ? env : "";
+  const blocked = testBlocked();
+  $("#envbar").innerHTML = !S.ctx || env === "other" ? "" : `<div class="envbar env-${env}" role="status"><b>${ENV_LABEL[env]} cluster</b><span class="mono">${esc(S.ctx)}</span><span>${env === "production" ? (blocked ? "Read-only. Network tests are off here." : "Read-only. Network tests need typed confirmation.") : "Read-only by default."}</span></div>`;
   const g = S.g;
   $("#ctxmeta").textContent = api.demoMode ? "Demo cluster, no kubeconfig used" : g?.serverVersion ? `Kubernetes ${g.serverVersion}` : "";
   const nss = [...new Set((g?.pods ?? []).map((p) => p.namespace).concat((g?.services ?? []).map((s) => s.namespace)))]
@@ -99,6 +132,7 @@ function renderSide() {
   $("#title").textContent = meta[1];
   $("#sub").textContent = meta[2];
   const n: string[] = [];
+  for (const pe of S.policy?.errors ?? []) n.push(`<div class="notice bad">Policy problem: ${esc(pe)} Active features are turned off until it's fixed.</div>`);
   if (S.error) n.push(`<div class="notice bad">${esc(S.error)}${S.g ? " Showing the last successful snapshot." : ""}</div>`);
   for (const w of g?.warnings ?? []) n.push(`<div class="notice">${esc(w)}</div>`);
   $("#notices").innerHTML = n.join("");
@@ -274,40 +308,79 @@ function viewEvents() {
 }
 
 function viewSettings() {
-  const st = S.settings;
+  const c = ctxSettings();
+  const p = S.policy;
+  const lockedNote = (rule: string) => (p?.locked.includes(rule) ? ' <span class="lock">set by your organisation</span>' : "");
+  const auto = S.envOf[S.ctx] ?? "other";
+  const envOpts = (["", "production", "staging", "development"] as const)
+    .filter((e) => e === "" || RANK[e as Environment] >= RANK[auto])
+    .map((e) => `<option value="${e}" ${c.environment === e ? "selected" : ""}>${e ? ENV_LABEL[e as Environment] : `Detected from name: ${ENV_LABEL[auto]}`}</option>`).join("");
   $("#view").innerHTML = `<div class="panel pad settings">
-    <h2>Cloud load balancer health</h2>
-    <p class="muted">Asks your cloud which load balancer targets are healthy, and explains why the rest fail. On AWS, Tessera runs read-only <span class="mono">aws elbv2 describe-*</span> and <span class="mono">aws elb describe-*</span> commands with the aws CLI you already use for EKS. It needs <span class="mono">elasticloadbalancing:Describe*</span> permissions and never stores credentials. GKE backend health is read from the ingress without any cloud call. Azure isn't supported yet.</p>
-    <label class="check" style="padding:0"><input type="checkbox" id="set-cloud" ${st.cloudChecks ? "checked" : ""}> Check cloud load balancer target health on every refresh</label>
+    <h2>This cluster</h2>
+    <p class="muted">These settings apply only to <span class="mono">${esc(S.ctx || "(none)")}</span>. Each cluster keeps its own, so a profile set for one account is never used for another.</p>
     <div class="grid2">
-      <label class="field" style="padding:0">AWS profile <input id="set-profile" value="${esc(st.awsProfile)}" placeholder="From your kubeconfig"></label>
-      <label class="field" style="padding:0">AWS region <input id="set-region" value="${esc(st.awsRegion)}" placeholder="From the load balancer name"></label>
+      <label class="field" style="padding:0">Environment <select id="set-env">${envOpts}</select><small>You can mark a cluster as more sensitive than its name suggests, but not less. To change detection, edit the patterns in the policy file.</small></label>
+      <span></span>
+      <label class="field" style="padding:0">AWS profile <input id="set-profile" value="${esc(c.awsProfile)}" placeholder="From this context's kubeconfig"></label>
+      <label class="field" style="padding:0">AWS region <input id="set-region" value="${esc(c.awsRegion)}" placeholder="From each load balancer's name"></label>
+      <label class="field" style="padding:0">Probe image <input id="set-image" value="${esc(c.probeImage)}" placeholder="busybox:1.36.1"><small>Use a mirror if this cluster can't pull from Docker Hub.</small></label>
+      <label class="field" style="padding:0">Cluster domain <input id="set-domain" value="${esc(c.clusterDomain)}" placeholder="cluster.local"></label>
     </div>
-    <h2 class="gap">Network tests</h2>
-    <p class="muted">Open a service and choose <b>Test connectivity</b>. Tessera shows you the exact probe pods it would create and runs nothing until you approve. The pods are non-root, have no service account token, and are deleted when the test ends (at most 90 seconds).</p>
-    <div class="grid2">
-      <label class="field" style="padding:0">Probe image <input id="set-image" value="${esc(st.probeImage)}" placeholder="busybox:1.36.1"><small>Use a mirror if your cluster can't pull from Docker Hub.</small></label>
-      <label class="field" style="padding:0">Cluster domain <input id="set-domain" value="${esc(st.clusterDomain)}" placeholder="cluster.local"></label>
-    </div>
+
+    <h2 class="gap">All clusters</h2>
+    <label class="check" style="padding:0"><input type="checkbox" id="set-cloud" ${S.global.cloudChecks && p?.allowCloudChecks !== false ? "checked" : ""} ${p?.allowCloudChecks === false ? "disabled" : ""}> Check cloud load balancer target health on every refresh${p?.allowCloudChecks === false ? ' <span class="lock">turned off by your organisation</span>' : ""}</label>
+    <p class="muted">On AWS, Tessera runs only read-only <span class="mono">aws elbv2 describe-*</span> and <span class="mono">aws elb describe-*</span> commands, using each cluster's own profile. GKE backend health is read from the ingress. Azure isn't supported yet.</p>
     <div class="row gap"><button class="btn primary" id="set-save">Save settings</button></div>
+
+    <h2 class="gap">Guardrails in effect</h2>
+    <table class="tbl"><tbody>
+      <tr><td>Network tests</td><td>${p?.allowNetworkTests === false ? "Off" : "On, after you approve each plan"}${lockedNote("allowNetworkTests")}</td></tr>
+      <tr><td>Network tests on production</td><td>${p?.allowNetworkTestsInProduction ? "On, with typed confirmation" : "Off"}${lockedNote("allowNetworkTestsInProduction")}</td></tr>
+      <tr><td>Cloud checks</td><td>${p?.allowCloudChecks === false ? "Off" : "Allowed (opt-in above)"}${lockedNote("allowCloudChecks")}</td></tr>
+      <tr><td>Production names</td><td class="mono">${esc((p?.productionContextPatterns ?? []).join("  "))}${lockedNote("productionContextPatterns")}</td></tr>
+      <tr><td>Staging names</td><td class="mono">${esc((p?.stagingContextPatterns ?? []).join("  "))}${lockedNote("stagingContextPatterns")}</td></tr>
+      <tr><td>Only these contexts</td><td class="mono">${esc((p?.allowedContexts ?? []).join("  ") || "All")}${lockedNote("allowedContexts")}</td></tr>
+      <tr><td>Hidden contexts</td><td class="mono">${esc((p?.hiddenContexts ?? []).join("  ") || "None")}${lockedNote("hiddenContexts")}</td></tr>
+      <tr><td>Activity log</td><td>${p?.auditLog === false ? "Off" : "On"}${lockedNote("auditLog")}</td></tr>
+      <tr><td>Policy files</td><td class="mono">${esc((p?.sources ?? []).join(", ") || "None, using defaults")}</td></tr>
+    </tbody></table>
+    <p class="muted" style="font-size:13px">See <b>docs/multi-environment.md</b> in the repository for the policy file format.</p>
+
+    <h2 class="gap">Activity log</h2>
+    <p class="muted" id="audit-path">Network tests, the pods they created and deleted, and actions blocked by policy.</p>
+    <div class="tbl-wrap"><table class="tbl" id="audit"><tbody><tr><td class="muted">Loading…</td></tr></tbody></table></div>
   </div>`;
+  api.auditLog(50).then(([rows, path]) => {
+    const t = document.querySelector("#audit");
+    if (!t) return;
+    $("#audit-path").textContent = `Network tests, the pods they created and deleted, and actions blocked by policy. Stored on this computer at ${path}.`;
+    t.innerHTML = rows.length
+      ? `<thead><tr><th>When</th><th>Cluster</th><th>What</th><th>Pods</th><th>Result</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="num muted">${ago(String(r.time))} ago</td><td><span class="mono">${esc(r.context)}</span><br><span class="muted">${esc(r.environment)}</span></td><td>${esc(r.action.replace(/_/g, " "))}<br><span class="muted mono">${esc([r.namespace, r.target].filter(Boolean).join(" "))}</span></td><td class="mono" style="font-size:12px">${r.podsCreated.length ? `created ${r.podsCreated.length}, deleted ${r.podsDeleted.length}` : "none"}</td><td>${esc(r.outcome)}</td></tr>`).join("")}</tbody>`
+      : `<tbody><tr><td class="muted">Nothing yet.</td></tr></tbody>`;
+  }).catch((e) => { const t = document.querySelector("#audit"); if (t) t.innerHTML = `<tbody><tr><td class="muted">${esc(String(e))}</td></tr></tbody>`; });
 }
 
 function saveSettings() {
   const v = (id: string) => ($(id) as HTMLInputElement).value.trim();
-  const before = S.settings.cloudChecks;
-  S.settings = {
-    cloudChecks: ($("#set-cloud") as HTMLInputElement).checked,
-    awsProfile: v("#set-profile"), awsRegion: v("#set-region"), probeImage: v("#set-image"), clusterDomain: v("#set-domain"),
-  };
-  store.set("tessera.settings", JSON.stringify(S.settings));
-  toast("Settings saved");
-  if (S.settings.cloudChecks !== before || S.settings.cloudChecks) refresh();
+  const beforeCloud = S.global.cloudChecks;
+  const beforeCtx = JSON.stringify(ctxSettings());
+  S.global = { cloudChecks: ($("#set-cloud") as HTMLInputElement).checked };
+  if (S.ctx) {
+    S.perCtx[S.ctx] = {
+      awsProfile: v("#set-profile"), awsRegion: v("#set-region"), probeImage: v("#set-image"), clusterDomain: v("#set-domain"),
+      environment: ($("#set-env") as HTMLSelectElement).value as ContextSettings["environment"],
+    };
+  }
+  store.set("tessera.settings", JSON.stringify(S.global));
+  store.set("tessera.contextSettings", JSON.stringify(S.perCtx));
+  toast(S.ctx ? `Saved for ${S.ctx}` : "Settings saved");
+  renderSide();
+  if (S.global.cloudChecks !== beforeCloud || (S.global.cloudChecks && JSON.stringify(ctxSettings()) !== beforeCtx)) refresh();
 }
 
 /* ---------------- Network test ---------------- */
 
-let netPlan: { id: string; plan: TestPlan } | null = null;
+let netPlan: PlanResponse | null = null;
 
 function drawerShell(h: string) {
   $("#overlay").innerHTML = `<div class="scrim" data-close></div><aside class="drawer" role="dialog" aria-modal="true" aria-label="Details"><button class="close" data-close aria-label="Close">×</button>${h}</aside>`;
@@ -317,20 +390,23 @@ function drawerShell(h: string) {
 async function planTest(ns: string, name: string, source?: string) {
   drawerShell(`<h2>Test connectivity to ${esc(name)}</h2><p class="muted"><span class="spin"></span> Working out what to test…</p>`);
   try {
-    netPlan = await api.planNetworkTest(S.ctx, ns, name, source ?? ns, S.settings);
+    const override = ctxSettings().environment || null;
+    netPlan = await api.planNetworkTest(S.ctx, ns, name, source ?? ns, settings(), override);
     showPlan();
   } catch (e) {
-    drawerShell(`<h2>Test connectivity to ${esc(name)}</h2><div class="notice bad">${esc(String(e))}</div>`);
+    drawerShell(`<h2>Test connectivity to ${esc(name)}</h2><div class="notice bad">${esc(String(e))}</div><p class="muted">This was recorded in the activity log (Settings).</p>`);
   }
 }
 
 function showPlan() {
-  const { plan } = netPlan!;
+  const { plan, requiresConfirmation, environment } = netPlan!;
   const ns = plan.service.namespace;
   const byKind = (k: string) => plan.checks.filter((c) => c.kind === k).length;
   drawerShell(`<h2>Test connectivity to ${esc(plan.service.name)}</h2>
     <p class="muted" style="margin:4px 0 14px">Nothing has been created yet. Review the plan, then run it.</p>
+    ${requiresConfirmation ? `<div class="notice bad"><b>This is a ${ENV_LABEL[environment].toLowerCase()} cluster.</b> Running this test creates ${plan.probes.length} short-lived probe ${plan.probes.length === 1 ? "pod" : "pods"} in <span class="mono">${esc(plan.sourceNamespace)}</span>. Type the context name to confirm.<input id="nt-confirm" class="mono" autocomplete="off" spellcheck="false" placeholder="${esc(S.ctx)}" style="display:block;width:100%;margin-top:8px;border:1px solid var(--line);border-radius:6px;padding:5px 8px;background:var(--panel)"></div>` : ""}
     <dl>
+      <dt>Cluster</dt><dd class="mono">${esc(S.ctx)} <span class="muted">(${esc(ENV_LABEL[environment].toLowerCase())})</span></dd>
       <dt>Probes from</dt><dd><input id="nt-src" value="${esc(plan.sourceNamespace)}" class="mono" style="width:100%;border:1px solid var(--line);border-radius:6px;padding:3px 6px;background:var(--panel2)"><small class="muted">Namespace the probes run in. Try the namespace of a client that can't connect.</small></dd>
       <dt>Probe pods</dt><dd>${plan.probes.map((p) => `${esc(p.placement.replace("-", " "))}${p.node ? ` on <span class="mono">${esc(p.node)}</span>` : ""}`).join("<br>")}</dd>
       <dt>Checks</dt><dd>${byKind("dns")} DNS, ${byKind("tcp")} TCP, ${byKind("http")} health endpoint</dd>
@@ -339,16 +415,17 @@ function showPlan() {
     <ul class="plist">${plan.checks.map((c) => `<li><span>${esc(c.label)}</span><span class="mono muted">${esc(c.port ? `${c.host}:${c.port}${c.path ?? ""}` : c.host)}</span></li>`).join("")}</ul>
     ${plan.notes.map((n) => `<p class="muted" style="font-size:13px">${esc(n)}</p>`).join("")}
     <details class="gap"><summary>Exact pods that will be created</summary><pre class="ev">${esc(plan.probes.map((p) => JSON.stringify(p.manifest, null, 2)).join("\n---\n"))}</pre></details>
-    <div class="row gap"><button class="btn primary" id="nt-run">Run test: create ${plan.probes.length} probe ${plan.probes.length === 1 ? "pod" : "pods"}</button><button class="btn" id="nt-replan" data-ns="${esc(ns)}" data-name="${esc(plan.service.name)}">Re-plan</button><button class="btn" data-close>Cancel</button></div>`);
+    <div class="row gap"><button class="btn primary" id="nt-run" ${requiresConfirmation ? "disabled" : ""}>Run test: create ${plan.probes.length} probe ${plan.probes.length === 1 ? "pod" : "pods"}</button><button class="btn" id="nt-replan" data-ns="${esc(ns)}" data-name="${esc(plan.service.name)}">Re-plan</button><button class="btn" data-close>Cancel</button></div>`);
 }
 
 async function runTest() {
   if (!netPlan) return;
-  const { id, plan } = netPlan;
+  const { id, plan, requiresConfirmation } = netPlan;
+  const confirmation = requiresConfirmation ? (document.querySelector<HTMLInputElement>("#nt-confirm")?.value.trim() ?? "") : null;
   netPlan = null;
   drawerShell(`<h2>Testing ${esc(plan.service.name)}</h2><p><span class="spin"></span> Probe pods are running. This usually takes 10 to 30 seconds, and they're deleted afterwards.</p>`);
   try {
-    showReport(await api.runNetworkTest(id, plan));
+    showReport(await api.runNetworkTest(id, plan, S.ctx, confirmation));
   } catch (e) {
     drawerShell(`<h2>Testing ${esc(plan.service.name)}</h2><div class="notice bad">${esc(String(e))}</div>`);
   }
@@ -359,7 +436,7 @@ function showReport(r: NetworkTestReport) {
   const cls = { ok: "ok", warning: "warn", critical: "bad" } as const;
   const resCls = (x: string) => (x === "ok" || /^[23]\d\d$/.test(x) ? "ok" : x === "refused" || /^\d{3}$/.test(x) ? "warn" : "bad");
   drawerShell(`<h2>Connectivity to ${esc(r.plan.service.name)}</h2>
-    <p class="muted" style="margin:4px 0 14px">From ${esc(r.plan.sourceNamespace)}. Probe pods have been deleted.</p>
+    <p class="muted" style="margin:4px 0 14px">From ${esc(r.plan.sourceNamespace)}. ${r.podsCreated.length === r.podsDeleted.length ? `All ${r.podsCreated.length} probe pods were deleted.` : `<b style="color:var(--bad)">Only ${r.podsDeleted.length} of ${r.podsCreated.length} probe pods were confirmed deleted.</b> Check with <span class="mono">kubectl get pods -A -l app.kubernetes.io/managed-by=tessera</span>.`} Recorded in the activity log.</p>
     <div class="layers">${r.findings.map((f) => `<div class="layer" style="grid-template-columns:26px minmax(0,1fr)"><span class="ic ${cls[f.status]}">${ICON[f.status]}</span><div><b>${esc(f.title)}</b><br>${esc(f.detail)}<p class="fix" style="margin:8px 0 0">${esc(f.suggestion)}</p></div></div>`).join("")}</div>
     ${r.runs.map((run) => `<h3 class="gap">From ${esc(run.placement.replace("-", " "))}${run.node ? `, ${esc(run.node)}` : ""}</h3>
       ${run.error ? `<div class="notice">${esc(run.error)}</div>` : ""}
@@ -374,7 +451,7 @@ let drawerPod: PodInfo | null = null;
 function lbHealthHtml(kind: string, ns: string, name: string): string {
   const hs = (S.g?.lbHealth ?? []).filter((h) => h.source.kind === kind && h.source.namespace === ns && h.source.name === name);
   if (!hs.length) {
-    return S.settings.cloudChecks ? "" : `<p class="muted" style="font-size:13px">Turn on cloud checks in Settings to see this load balancer's target health.</p>`;
+    return S.global.cloudChecks ? "" : `<p class="muted" style="font-size:13px">Turn on cloud checks in Settings to see this load balancer's target health.</p>`;
   }
   return hs.map((h) => `<h3 class="gap">Load balancer targets</h3><p class="muted mono" style="font-size:12px;margin:0 0 6px">${esc(h.lbName || h.dnsName)}</p>
     ${h.error ? `<div class="notice">${esc(h.error)}</div>` : ""}
@@ -420,7 +497,7 @@ function openDrawer(kind: string, id: string) {
         <dt>Cluster IP</dt><dd class="mono">${esc(s.clusterIp ?? "")}</dd><dt>Ports</dt><dd class="mono">${esc(s.ports.join(", "))}</dd>
         ${s.external.length ? `<dt>External</dt><dd class="mono">${esc(s.external.join(", "))}</dd>` : ""}
         <dt>Endpoints</dt><dd><span class="st ${s.readyEndpoints ? "ok" : "bad"}">${s.readyEndpoints} ready</span>${s.notReadyEndpoints ? `, ${s.notReadyEndpoints} not ready` : ""}</dd></dl>
-        <div class="row"><button class="btn" data-nettest="${esc(`${s.namespace}/${s.name}`)}">Test connectivity</button><span class="muted" style="font-size:13px">Shows a plan first; nothing runs until you approve.</span></div>
+        <div class="row">${testBlocked() ? `<button class="btn" disabled>Test connectivity</button><span class="muted" style="font-size:13px">${esc(testBlocked()!)}</span>` : `<button class="btn" data-nettest="${esc(`${s.namespace}/${s.name}`)}">Test connectivity</button><span class="muted" style="font-size:13px">Shows a plan first; nothing runs until you approve.</span>`}</div>
         ${s.workloads.length ? `<h3>Workloads</h3><ul class="plist">${s.workloads.map((w) => `<li><button class="linkbtn" data-kind="workload" data-id="${esc(w)}">${esc(w.split("/").slice(-1)[0])}</button><span class="muted">${esc(w.split("/")[0])}</span></li>`).join("")}</ul>` : ""}
         <h3 class="gap">Pods</h3>${podList(pods)}
         ${relatedIssues((i) => i.target.kind === "Service" && i.target.namespace === s.namespace && i.target.name === s.name)}`;
@@ -498,7 +575,7 @@ async function refresh() {
   renderSide();
   if (!S.g) render();
   try {
-    const g = await api.snapshot(S.ctx, S.settings);
+    const g = await api.snapshot(S.ctx, settings());
     if (mine !== seq) return;
     S.g = g;
     S.error = "";
@@ -522,8 +599,10 @@ function schedule() {
 async function reloadContexts() {
   try {
     const c = await api.listContexts();
+    S.policy = await api.getPolicy();
     S.contexts = c.contexts.map((x) => x.name);
-    S.setupError = S.contexts.length ? "" : "Your kubeconfig has no contexts.";
+    S.envOf = Object.fromEntries(c.contexts.map((x) => [x.name, x.environment]));
+    S.setupError = S.contexts.length ? "" : "No contexts are available. Check your kubeconfig, or your Tessera policy's allowed and hidden contexts.";
     if (!S.contexts.includes(S.ctx)) {
       S.ctx = c.current && S.contexts.includes(c.current) ? c.current : S.contexts[0] ?? "";
       S.g = null;
@@ -539,7 +618,9 @@ async function init() {
   shell();
   try {
     const c = await api.listContexts();
+    S.policy = await api.getPolicy();
     S.contexts = c.contexts.map((x) => x.name);
+    S.envOf = Object.fromEntries(c.contexts.map((x) => [x.name, x.environment]));
     const saved = store.get("tessera.ctx");
     S.ctx = saved && S.contexts.includes(saved) ? saved : c.current && S.contexts.includes(c.current) ? c.current : S.contexts[0] ?? "";
     if (!S.ctx) S.setupError = "Your kubeconfig has no contexts.";
@@ -609,6 +690,11 @@ document.addEventListener("change", (e) => {
 
 document.addEventListener("input", (e) => {
   const t = e.target as HTMLInputElement;
+  if (t.id === "nt-confirm") {
+    const btn = document.querySelector<HTMLButtonElement>("#nt-run");
+    if (btn) btn.disabled = t.value.trim() !== S.ctx;
+    return;
+  }
   if (t.id === "podq") {
     S.podQuery = t.value;
     const pos = t.selectionStart ?? t.value.length;

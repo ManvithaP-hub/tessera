@@ -20,6 +20,13 @@ should get a response within five working days.
   keeps. Probe pods are non-root, drop all capabilities, have a read-only
   filesystem and no service account token, stop after 90 seconds, and are
   always deleted afterwards.
+- Production contexts (detected by name, or marked in Settings) block network
+  tests unless an organisation policy allows them, and then require typing the
+  context name. This is enforced in the Rust backend.
+- An optional system-wide policy file can lock these rules for all users and
+  fails safe if it can't be read. See `docs/multi-environment.md`.
+- Network tests and blocked attempts are written to a local activity log,
+  including which probe pods were created and confirmed deleted.
 - Cloud checks are off by default. When on, Tessera runs only these `aws`
   commands: `elbv2 describe-load-balancers`, `elbv2 describe-target-groups`,
   `elbv2 describe-target-health`, `elb describe-load-balancers` and

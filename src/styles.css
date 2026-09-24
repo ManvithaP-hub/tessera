@@ -155,3 +155,13 @@ pre.ev { background: var(--code); color: var(--codetext); font: 12px/1.6 var(--m
 .settings p { max-width: 75ch; }
 details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 @media (max-width: 900px) { .settings .grid2 { grid-template-columns: 1fr; } }
+.envbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; border-radius: 10px; padding: 9px 14px; margin-bottom: 14px; font-size: 14px; }
+.envbar .mono { font-size: 13px; }
+.env-production { background: var(--bad); color: #fff; }
+.env-staging { background: var(--warn-soft); color: var(--text); border: 1px solid var(--warn); }
+.env-development { background: var(--ok-soft); color: var(--text); }
+.app[data-env="production"] .side { box-shadow: inset 4px 0 0 var(--bad); }
+.app[data-env="staging"] .side { box-shadow: inset 4px 0 0 var(--warn); }
+.app[data-env="development"] .side { box-shadow: inset 4px 0 0 var(--ok); }
+.lock { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; margin-left: 6px; white-space: nowrap; }
+.settings select { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 14px; color: var(--text); }

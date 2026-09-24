@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0: environment guardrails
+
+- **Production protection.** Contexts are classified as production, staging or
+  development from their names. Production shows a red banner, and network
+  tests are off there by default; when an administrator allows them, the
+  context name must be typed to confirm. Enforced in the backend.
+- **Per-cluster settings.** AWS profile, region, probe image and cluster domain
+  are now saved per context. The previous global values aren't carried over;
+  set them again under Settings → This cluster.
+- **Organisation policy file.** `~/.tessera/policy.json` and a system-wide file
+  can turn network tests or cloud checks off, allow or hide contexts, and change
+  environment detection. The system file overrides users and fails safe.
+- **Activity log.** Network tests, the probe pods they created and deleted, and
+  blocked attempts are recorded locally and shown in Settings.
+- **Environment in the Context menu**, and a coloured stripe on the sidebar.
+- New guide: `docs/multi-environment.md`, with SSO profile setup, RBAC, IAM
+  (`docs/iam-policy.json`), a namespace-scoped network-test role
+  (`docs/rbac-network-tests.yaml`) and an example policy.
+
 ## 0.1.1
 
 - Refresh now re-reads your kubeconfig, so clusters you add appear without restarting Tessera.

@@ -1,12 +1,26 @@
 // A small, deterministic demo cluster used when running outside Tauri.
 // Its issues mirror what tessera-core produces for the same state.
 
-import type { ClusterGraph, Contexts, Issue, LbHealth, NetworkTestReport, PodInfo, ServiceInfo, TestPlan, WorkloadInfo } from "./types";
+import type { AuditEntry, ClusterGraph, Contexts, Issue, LbHealth, NetworkTestReport, PodInfo, Policy, ServiceInfo, TestPlan, WorkloadInfo } from "./types";
 
 export const demoContexts: Contexts = {
   current: "demo-shop",
-  contexts: [{ name: "demo-shop", cluster: "demo", user: null, namespace: null }],
+  contexts: [
+    { name: "demo-shop", environment: "other", cluster: "demo", user: null, namespace: null },
+    { name: "dev-use1-payments", environment: "development", cluster: "demo", user: null, namespace: null },
+    { name: "prod-usw2-payments", environment: "production", cluster: "demo", user: null, namespace: null },
+  ],
 };
+
+export const demoPolicy: Policy = {
+  allowNetworkTests: true, allowNetworkTestsInProduction: false, allowCloudChecks: true,
+  productionContextPatterns: ["*prod*", "*prd*", "*production*", "*live*"],
+  stagingContextPatterns: ["*stag*", "*stg*", "*uat*", "*preprod*", "*qa*"],
+  developmentContextPatterns: ["*dev*", "*test*", "*sandbox*", "*lab*", "kind-*", "minikube", "docker-desktop", "*local*"],
+  allowedContexts: [], hiddenContexts: [], auditLog: true, sources: [], locked: [], errors: [],
+};
+
+export const demoAudit: AuditEntry[] = [];
 
 const MI = 1024 * 1024;
 const nodes = ["ip-10-0-12-41", "ip-10-0-24-7", "ip-10-0-38-110"];
@@ -248,6 +262,8 @@ export function demoReport(plan: TestPlan): NetworkTestReport {
   return {
     plan,
     runs: [{ node: nodes[1], placement: "same-node", results: res(false), error: null }, { node: nodes[0], placement: "other-node", results: res(true), error: null }],
+    podsCreated: ["tessera-probe-x7k2p", "tessera-probe-m4q9d"],
+    podsDeleted: ["tessera-probe-x7k2p", "tessera-probe-m4q9d"],
     findings: [
       { status: "critical", title: "Cross-node traffic to 10.0.2.70:8080 is dropped",
         detail: `pod ${plan.service.name}-7c9d1f5b8-m8zrt port 8080 answers from its own node but times out from ${nodes[0]}. Pod networking between nodes is broken, which is a CNI or node firewall problem, not the app.`,

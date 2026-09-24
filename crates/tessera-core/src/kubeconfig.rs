@@ -12,6 +12,8 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct ContextInfo {
     pub name: String,
+    /// Detected from the context name using the policy's patterns.
+    pub environment: crate::policy::Environment,
     pub cluster: String,
     pub user: Option<String>,
     pub namespace: Option<String>,
@@ -24,7 +26,8 @@ pub struct Contexts {
     pub contexts: Vec<ContextInfo>,
 }
 
-pub fn list_contexts() -> Result<Contexts> {
+/// Contexts the policy allows, each labelled with its environment.
+pub fn list_contexts(policy: &crate::policy::Policy) -> Result<Contexts> {
     let kc = Kubeconfig::read().map_err(|e| {
         Error::Kubeconfig(format!(
             "Couldn't read a kubeconfig. Tessera looks at $KUBECONFIG, then ~/.kube/config. ({e})"
@@ -36,12 +39,14 @@ pub fn list_contexts() -> Result<Contexts> {
         .map(|nc| {
             let ctx = nc.context.as_ref();
             ContextInfo {
+                environment: policy.classify(&nc.name),
                 name: nc.name.clone(),
                 cluster: ctx.map(|c| c.cluster.clone()).unwrap_or_default(),
                 user: ctx.and_then(|c| c.user.clone()),
                 namespace: ctx.and_then(|c| c.namespace.clone()),
             }
         })
+        .filter(|c: &ContextInfo| policy.context_allowed(&c.name))
         .collect();
     Ok(Contexts { current: kc.current_context.clone(), contexts })
 }

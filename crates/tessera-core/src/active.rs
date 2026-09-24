@@ -111,6 +111,9 @@ pub struct NetworkTestReport {
     pub plan: TestPlan,
     pub runs: Vec<ProbeRun>,
     pub findings: Vec<Finding>,
+    /// Names of probe pods created and confirmed deleted, for the audit log.
+    pub pods_created: Vec<String>,
+    pub pods_deleted: Vec<String>,
 }
 
 /* ---------------- Planning ---------------- */
@@ -451,11 +454,20 @@ pub async fn run(client: Client, plan: TestPlan) -> NetworkTestReport {
         });
     }
     // Always clean up, whatever happened.
+    let mut deleted = Vec::new();
     for (_, name) in &created {
-        let _ = api.delete(name, &DeleteParams::background()).await;
+        if api.delete(name, &DeleteParams::background()).await.is_ok() {
+            deleted.push(name.clone());
+        }
     }
     let findings = analyze(&plan, &runs);
-    NetworkTestReport { plan, runs, findings }
+    NetworkTestReport {
+        plan,
+        runs,
+        findings,
+        pods_created: created.into_iter().map(|(_, n)| n).collect(),
+        pods_deleted: deleted,
+    }
 }
 
 /* ---------------- Analysis ---------------- */

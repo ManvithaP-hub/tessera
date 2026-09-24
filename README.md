@@ -50,20 +50,38 @@ and what to change.
 
 ![Network test](docs/screenshot-network-test.png)
 
-## Safe by design
+## Guardrails
 
-- **Read-only by default.** Tessera only uses `get` and `list`, plus reading
-  pod logs. A minimal ClusterRole is in [`docs/rbac.yaml`](docs/rbac.yaml).
-- **Active tests only with your approval.** A network test shows you the exact
-  probe pods first, and creates nothing until you click Run. The pods are
-  non-root, have no service account token or capabilities, stop after 90
-  seconds, and are deleted when the test ends.
-- **Cloud checks are opt-in.** Load balancer target health uses your existing
-  `aws` CLI with a fixed list of read-only `describe` calls. No cloud
-  credentials are stored.
-- **No telemetry.** It talks to your API servers and nothing else.
-- **Local only.** Credentials stay in memory in the Rust process. The UI can't
-  touch your filesystem or the network.
+Tessera is built to be safe to point at production.
+
+| Area | Guardrail |
+|---|---|
+| Cluster access | **Read-only by default**: only `get`, `list` and pod logs. Minimal role in [`docs/rbac.yaml`](docs/rbac.yaml) |
+| Identity | Uses each context's own kubeconfig identity, so it can never do more than `kubectl` could |
+| Network tests | You see the exact probe pods first; nothing runs until you approve. Probe pods are non-root, have no token or capabilities, stop after 90 seconds and are always deleted |
+| **Production protection** | Production contexts are detected by name, shown with a red banner, and **network tests are off** there by default. If allowed, you must type the context name. Enforced in the backend |
+| **Per-cluster settings** | AWS profile, region and probe image are kept separately per context, so one account's settings never apply to another |
+| **Organisation policy** | An optional policy file can turn features off, limit or hide contexts, and change how production is detected. A system-managed file overrides users and fails safe |
+| **Activity log** | Every network test, the pods it created and deleted, and every blocked attempt is recorded locally |
+| Cloud checks | Opt-in; only five read-only AWS `describe` commands, using each cluster's own profile. Minimal IAM policy in [`docs/iam-policy.json`](docs/iam-policy.json) |
+| Credentials and privacy | Nothing stored, no telemetry, and the UI has no file, shell or network access |
+
+## Multiple clusters, accounts and regions
+
+Tessera works with every context in your kubeconfig, one at a time and fully
+isolated. Give each cluster a clear alias and its own profile:
+
+```sh
+aws eks update-kubeconfig --name payments --region us-east-1 --profile dev-sso  --alias dev-use1-payments
+aws eks update-kubeconfig --name payments --region us-west-2 --profile prod-sso --alias prod-usw2-payments
+```
+
+`prod-usw2-payments` is then recognised as production, and cloud checks for
+each cluster use that cluster's own AWS account and region.
+
+**Full guide:** [docs/multi-environment.md](docs/multi-environment.md) covers
+SSO profiles, environment detection, recommended RBAC and IAM, the policy file
+format, and the activity log.
 
 ## Install
 

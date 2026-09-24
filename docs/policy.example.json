@@ -1,0 +1,11 @@
+{
+  "allowNetworkTests": true,
+  "allowNetworkTestsInProduction": false,
+  "allowCloudChecks": true,
+  "productionContextPatterns": ["*prod*", "*prd*", "*production*", "*live*"],
+  "stagingContextPatterns": ["*stag*", "*stg*", "*uat*", "*preprod*", "*qa*"],
+  "developmentContextPatterns": ["*dev*", "*test*", "*sandbox*", "*lab*", "kind-*", "minikube", "docker-desktop", "*local*"],
+  "allowedContexts": [],
+  "hiddenContexts": ["*-legacy-*"],
+  "auditLog": true
+}

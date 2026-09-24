@@ -5,12 +5,14 @@
 //! `get`, or a log read.
 
 pub mod active;
+pub mod audit;
 pub mod cloud;
 pub mod collect;
 pub mod diagnose;
 pub mod extended;
 pub mod kubeconfig;
 pub mod model;
+pub mod policy;
 pub mod quantity;
 
 pub use collect::{build_graph, collect, pod_logs, CollectOptions, RawSnapshot};
