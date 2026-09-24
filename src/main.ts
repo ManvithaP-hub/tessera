@@ -113,7 +113,7 @@ function render() {
   }
   if (S.view === "settings") { viewSettings(); return; }
   if (!S.g) {
-    v.innerHTML = S.loading ? `<div class="panel empty"><span class="spin"></span> Reading ${esc(S.ctx)}…</div>` : `<div class="panel empty"><h2>Couldn't read ${esc(S.ctx)}</h2><p>Check that your credentials are current (for example, run <span class="mono">aws sso login</span> or <span class="mono">gcloud auth login</span>), then select Refresh.</p></div>`;
+    v.innerHTML = S.loading ? `<div class="panel empty"><span class="spin"></span> Reading ${esc(S.ctx)}…</div>` : `<div class="panel empty"><h2>Couldn't read ${esc(S.ctx)}</h2><p>${esc(S.error.replace(/^Couldn't read [^:]*: /, "").replace(/ \(Details:.*$/, "")) || "Check that your credentials are current, then select Refresh."}</p><p class="muted" style="font-size:13px">Pick another cluster from the Context menu, or select Refresh after fixing the problem. New clusters in your kubeconfig appear when you refresh.</p></div>`;
     return;
   }
   ({ map: viewMap, issues: viewIssues, workloads: viewWorkloads, events: viewEvents, settings: viewSettings })[S.view]();
@@ -518,6 +518,23 @@ function schedule() {
   if (S.auto) timer = window.setInterval(() => { if (!document.hidden && !$("#overlay").innerHTML) refresh(); }, REFRESH_MS);
 }
 
+/** Re-read the kubeconfig so newly added clusters appear without a restart. */
+async function reloadContexts() {
+  try {
+    const c = await api.listContexts();
+    S.contexts = c.contexts.map((x) => x.name);
+    S.setupError = S.contexts.length ? "" : "Your kubeconfig has no contexts.";
+    if (!S.contexts.includes(S.ctx)) {
+      S.ctx = c.current && S.contexts.includes(c.current) ? c.current : S.contexts[0] ?? "";
+      S.g = null;
+      S.error = "";
+    }
+  } catch (e) {
+    S.setupError = String(e);
+  }
+  renderSide();
+}
+
 async function init() {
   shell();
   try {
@@ -576,7 +593,7 @@ document.addEventListener("click", (e) => {
   else if (t.dataset.issue) { closeOverlay(); S.selIssue = t.dataset.issue; go("issues"); }
   else if (t.dataset.copy) navigator.clipboard?.writeText(t.dataset.copy).then(() => toast("Copied"), () => toast("Copy isn't available here"));
   else if (t.dataset.close !== undefined) closeOverlay();
-  else if (t.id === "refresh") api.resetConnection(S.ctx).then(refresh);
+  else if (t.id === "refresh") reloadContexts().then(() => api.resetConnection(S.ctx)).then(refresh);
   else if (t.id === "theme") toggleTheme();
   else if (t.id === "logload") loadLogs();
 });

@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.1
+
+- Refresh now re-reads your kubeconfig, so clusters you add appear without restarting Tessera.
+- Clearer connection errors: an unreachable or deleted cluster, expired cloud login, rejected credentials, missing login helper or bad certificate each get a plain explanation, with the original error kept for bug reports.
+- Node labels on the traffic map say "1 pod" instead of "1 pods".
+- README explains which Mac download to choose (Apple Silicon or Intel).
+
+## 0.1.0
 
 First public release.
 

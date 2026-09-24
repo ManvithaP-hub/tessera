@@ -22,7 +22,7 @@ async fn client(state: &AppState, context: &str) -> Result<Client, String> {
     if let Some(c) = clients.get(context) {
         return Ok(c.clone());
     }
-    let c = tessera_core::client_for(context).await.map_err(|e| e.to_string())?;
+    let c = tessera_core::client_for(context).await.map_err(|e| tessera_core::explain_error(&e.to_string()))?;
     clients.insert(context.to_string(), c.clone());
     Ok(c)
 }
@@ -49,7 +49,7 @@ async fn cluster_snapshot(
             // Drop the cached client so the next attempt re-reads the
             // kubeconfig (for example after `aws sso login`).
             forget(&state, &context).await;
-            Err(e.to_string())
+            Err(tessera_core::explain_error(&e.to_string()))
         }
     }
 }

@@ -181,7 +181,7 @@ export function renderMap(g: ClusterGraph, rows: Row[], h: Health, animate: bool
     const info = nodeInfo.get(n);
     const count = rows.reduce((a, r) => a + r.pods.filter((p) => p.node === n).length, 0);
     const c = cls(tkey("Node", "", n)) || (info && !info.ready ? "bad" : "");
-    boxes += box(X.node, nodeY.get(n)!, "node", n, n, `${info?.instanceType ?? "node"}, ${count} pods here`, c);
+    boxes += box(X.node, nodeY.get(n)!, "node", n, n, `${info?.instanceType ?? "node"}, ${count} ${count === 1 ? "pod" : "pods"} here`, c);
   }
 
   const heads = ([["entry", "Entry"], ["svc", "Service"], ["wl", "Workload"], ["pods", "Pods"], ["node", "Nodes"]] as const)

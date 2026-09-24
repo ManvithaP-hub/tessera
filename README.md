@@ -68,7 +68,18 @@ and what to change.
 ## Install
 
 Download the installer for your platform from
-[Releases](https://github.com/ManvithaP-hub/tessera/releases).
+[Releases](https://github.com/ManvithaP-hub/tessera/releases):
+
+| Your computer | Download |
+|---|---|
+| Mac with Apple Silicon (M1 or later) | `Tessera_<version>_aarch64.dmg` |
+| Mac with an Intel chip | `Tessera_<version>_x64.dmg` |
+| Windows | `Tessera_<version>_x64-setup.exe` (or the `.msi`) |
+| Linux | `.AppImage`, `.deb` or `.rpm` |
+
+Not sure which Mac you have? Apple menu → **About This Mac**: "Chip: Apple M…" means Apple Silicon, "Processor: Intel" means Intel. Or run `uname -m` in Terminal: `arm64` is Apple Silicon, `x86_64` is Intel. The wrong one fails with "incorrect executable format".
+
+On a Mac, open the `.dmg` and drag **Tessera** into **Applications**.
 
 Early builds are not code-signed yet:
 
